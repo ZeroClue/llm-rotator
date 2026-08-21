@@ -201,7 +201,7 @@ PROXY_AUTH_TOKEN = os.getenv("PROXY_AUTH_TOKEN", "")
 
 @app.before_request
 def require_bearer_token():
-    if not PROXY_AUTH_TOKEN or request.path == "/health":
+    if not PROXY_AUTH_TOKEN or request.path in ("/health", "/ready"):
         return None
     provided = request.headers.get("Authorization", "")
     # Bytes, not str: compare_digest raises TypeError on non-ASCII str, and
@@ -1053,18 +1053,33 @@ def dynamic_failover_proxy(path):
     )
 
 
+def nodes_available_count():
+    """Nodes not currently in cooldown, per the iterator's own clock."""
+    return sum(1 for e in node_iterator.snapshot() if e["cooldown_seconds"] <= 0)
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for monitoring."""
     return jsonify({
         "status": "healthy",
         "nodes_configured": len(NODE_POOL),
+        "nodes_available": nodes_available_count(),
         "current_node_index": node_iterator.get_current_index(),
         "nodes": node_iterator.snapshot(),
         "token_optimization_enabled": ENABLE_CONTEXT_COMPRESSION,
         "max_context_tokens": MAX_CONTEXT_TOKENS,
         "reserved_response_tokens": RESERVED_RESPONSE_TOKENS
     }), 200
+
+
+@app.route('/ready', methods=['GET'])
+def ready_check():
+    """Readiness for orchestrators: 503 while every node is in cooldown."""
+    available = nodes_available_count()
+    if available == 0:
+        return jsonify({"status": "unavailable", "nodes_available": 0}), 503
+    return jsonify({"status": "ready", "nodes_available": available}), 200
 
 
 @app.route('/v1/models', methods=['GET'])
