@@ -17,6 +17,7 @@ Features:
 
 import os
 import re
+import hmac
 import json
 import time
 import random
@@ -191,6 +192,30 @@ except Exception as e:
 # Initialize Flask app and session
 app = Flask(__name__)
 session = Session()
+
+# Optional bearer-token gate. Empty disables auth entirely (current behavior
+# for existing deployments). /health stays open either way so orchestrators
+# can probe the process without holding the token.
+PROXY_AUTH_TOKEN = os.getenv("PROXY_AUTH_TOKEN", "")
+
+
+@app.before_request
+def require_bearer_token():
+    if not PROXY_AUTH_TOKEN or request.path == "/health":
+        return None
+    provided = request.headers.get("Authorization", "")
+    if not hmac.compare_digest(provided, f"Bearer {PROXY_AUTH_TOKEN}"):
+        return Response(
+            json.dumps({
+                "error": {
+                    "message": "Invalid or missing bearer token",
+                    "type": "auth_error",
+                }
+            }),
+            401,
+            {"Content-Type": "application/json"},
+        )
+    return None
 
 
 class ThreadSafeIterator:

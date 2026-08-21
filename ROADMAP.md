@@ -20,7 +20,7 @@ GitHub Actions (or equivalent) running on every push/PR:
 this reason; the image was unbuildable while README claimed production readiness.
 *Acceptance:* a commit that breaks tests or the build turns CI red.
 
-### 2. Optional bearer-token auth in the proxy — `todo`
+### 2. Optional bearer-token auth in the proxy — `done` (2026-08-21)
 New env var `PROXY_AUTH_TOKEN` (empty = disabled, current behavior). When set,
 reject requests whose `Authorization` doesn't match before proxying; `/health`
 stays open for orchestrators.

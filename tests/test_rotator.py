@@ -270,6 +270,56 @@ def test_snapshot_reports_remaining_cooldown(rotator, monkeypatch):
     assert snap[2]["cooldown_seconds"] == 0.0
 
 
+def test_auth_token_rejects_missing_header(rotator, monkeypatch, client, chat_captures):
+    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": BASIC_MESSAGES},
+    )
+    assert resp.status_code == 401
+    assert chat_captures() == []  # never reached upstream
+
+
+def test_auth_token_gates_wrong_and_admits_correct(rotator, monkeypatch, client, chat_captures):
+    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    auth = {"Authorization": "Bearer sekrit"}
+    wrong = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": BASIC_MESSAGES},
+        headers={"Authorization": "Bearer nope"},
+    )
+    assert wrong.status_code == 401
+    right = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": BASIC_MESSAGES},
+        headers=auth,
+    )
+    assert right.status_code == 200
+    assert len(chat_captures()) == 1
+
+
+def test_health_stays_open_with_auth_enabled(rotator, monkeypatch, client):
+    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.get_json()["status"] == "healthy"
+
+
+def test_auth_disabled_by_default(rotator, monkeypatch, client):
+    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "")
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": BASIC_MESSAGES},
+    )
+    assert resp.status_code == 200
+
+
+def test_models_endpoint_requires_token_too(rotator, monkeypatch, client):
+    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    assert client.get("/v1/models").status_code == 401
+    assert client.get("/v1/models", headers={"Authorization": "Bearer sekrit"}).status_code == 200
+
+
 def test_unknown_path_returns_404(client):
     resp = client.get("/definitely/not/here")
     assert resp.status_code == 404
