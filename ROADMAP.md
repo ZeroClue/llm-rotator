@@ -102,6 +102,6 @@ for newer OpenAI models alongside legacy `max_tokens`.
 
 ## Repo hygiene quick-wins
 
-- [ ] Untrack the committed bytecode: `git rm -r --cached __pycache__` (ignore rules now exist; tracked files ignore them).
-- [ ] LICENSE file referenced by README doesn't exist — add MIT text or drop the claim.
-- [ ] `tailscale_acl.json`, `PR_DESCRIPTION.md` review: keep or fold into docs/.
+- [x] Untrack the committed bytecode — done 2026-08-21 (`git rm -r --cached __pycache__`; files remain on disk, now ignored).
+- [x] LICENSE file referenced by README didn't exist — MIT text added (holder: ZeroClue, matching git identity/repo org).
+- [x] `tailscale_acl.json`, `PR_DESCRIPTION.md` review — both deleted 2026-08-21: the ACL file was invalid JSON/HuJSON duplicating README's Security section; PR_DESCRIPTION described merged PRs and contained inaccurate claims (e.g., `/health/detailed`). Recoverable from git history.
