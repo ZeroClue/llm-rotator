@@ -283,13 +283,14 @@ def test_auth_token_rejects_missing_header(rotator, monkeypatch, client, chat_ca
 
 def test_auth_token_gates_wrong_and_admits_correct(rotator, monkeypatch, client, chat_captures):
     monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    before = len(chat_captures())
     wrong = client.post(
         "/v1/chat/completions",
         json={"model": "gpt-4o", "messages": BASIC_MESSAGES},
         headers={"Authorization": "Bearer nope"},
     )
     assert wrong.status_code == 401
-    before = len(chat_captures())
+    assert len(chat_captures()) == before  # wrong token never reached upstream
     right = client.post(
         "/v1/chat/completions",
         json={"model": "gpt-4o", "messages": BASIC_MESSAGES},
@@ -297,6 +298,16 @@ def test_auth_token_gates_wrong_and_admits_correct(rotator, monkeypatch, client,
     )
     assert right.status_code == 200
     assert len(chat_captures()) == before + 1
+
+
+def test_auth_token_non_ascii_header_gets_401_not_500(rotator, monkeypatch, client):
+    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": BASIC_MESSAGES},
+        headers={"Authorization": "Bearer tøken"},
+    )
+    assert resp.status_code == 401
 
 
 def test_health_stays_open_with_auth_enabled(rotator, monkeypatch, client):

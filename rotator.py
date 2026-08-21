@@ -204,7 +204,11 @@ def require_bearer_token():
     if not PROXY_AUTH_TOKEN or request.path == "/health":
         return None
     provided = request.headers.get("Authorization", "")
-    if not hmac.compare_digest(provided, f"Bearer {PROXY_AUTH_TOKEN}"):
+    # Bytes, not str: compare_digest raises TypeError on non-ASCII str, and
+    # client-supplied headers can contain anything. utf-8 encoding never does.
+    if not hmac.compare_digest(
+        provided.encode("utf-8"), f"Bearer {PROXY_AUTH_TOKEN}".encode("utf-8")
+    ):
         return Response(
             json.dumps({
                 "error": {
