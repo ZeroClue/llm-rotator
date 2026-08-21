@@ -18,6 +18,10 @@ htmlcov/
 # --- Session-local analysis (not for publication) ---
 FINDINGS.md
 
+# --- Agent tooling (installed artifacts & local state; lockfile is tracked) ---
+.agents/
+.claude/
+
 # --- OS junk ---
 .DS_Store
 Thumbs.db
