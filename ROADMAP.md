@@ -10,7 +10,7 @@ Status vocabulary: `todo` · `in progress` · `done`.
 
 ## Now (high value, small effort)
 
-### 1. CI pipeline — `todo`
+### 1. CI pipeline — `done` (2026-08-21)
 GitHub Actions (or equivalent) running on every push/PR:
 1. `pip install -r requirements.txt && pip install pytest` → `pytest tests/ -v`
 2. `python3 -m py_compile rotator.py`
