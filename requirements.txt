@@ -1,0 +1,27 @@
+# Tailscale LLM Proxy Rotator - Requirements
+
+Core dependencies for the secure proxy rotator with token optimization.
+
+Flask>=2.3.0
+requests>=2.31.0
+tiktoken>=0.5.0
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+## Optional: Install python-dotenv for loading .env files
+
+If you want to automatically load environment variables from a `.env` file:
+
+```bash
+pip install python-dotenv
+```
+
+Then add this to the top of `rotator.py`:
+```python
+from dotenv import load_dotenv
+load_dotenv()
+```

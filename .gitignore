@@ -4,26 +4,29 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Logs and temp files
+.Python
+env/
+venv/
+.venv/
+.ENV
+.ENV.*
+.venv/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
 *.log
-*.tmp
-*.swp
-
-# Environment
-.env
-.env.local
-*.env.*
-
-# Editors
-.vscode/
-.idea/
-
-# OS
+*.sqlite
+*.sqlite3
 .DS_Store
 Thumbs.db
 ```node_modules/
 .next/
 dist/
 build/
-node_modules/
