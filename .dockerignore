@@ -25,6 +25,8 @@ venv/
 # Documentation
 README.md
 docs/
+AGENTS.md
+PR_DESCRIPTION.md
 
 # Testing
 tests/

@@ -23,9 +23,16 @@ ProtectHome=read-only
 PrivateTmp=true
 ReadWritePaths=/var/log/llm-rotator
 
+# Node configuration is mandatory (PROXY_1_URL / API_KEY_1 at minimum).
+# Put it in an environment file the daemon can read, e.g. /etc/llm-rotator.env:
+#   LLM_PROVIDER_URL=https://api.openai.com/v1
+#   PROXY_1_URL=socks5h://100.64.0.1:1055
+#   API_KEY_1=sk-proj-xxxxx
+EnvironmentFile=-/etc/llm-rotator.env
+
 # Environment variables (optional - override defaults)
-Environment="TARGET_PROVIDER_URL=https://api.openai.com/v1"
-Environment="BIND_PORT=8080"
+Environment="LLM_PROVIDER_URL=https://api.openai.com/v1"
+Environment="PROXY_BIND_PORT=8080"
 Environment="MAX_RETRIES=4"
 
 [Install]

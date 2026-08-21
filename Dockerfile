@@ -1,18 +1,11 @@
 # Secure Tailscale LLM Proxy Rotator
 FROM python:3.12-slim
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set working directory
 WORKDIR /app
 
 # Copy only requirements first (for layer caching)
@@ -22,19 +15,24 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY rotator.py .
+COPY rotator.py gunicorn.conf.py ./
+
+# Pre-cache the tiktoken BPE file for the default model so first startup
+# never stalls on a tokenizer download (matters on egress-restricted hosts).
+# The build fails here if the cache directory ends up empty.
+ENV TIKTOKEN_CACHE_DIR=/app/.tiktoken-cache
+RUN python -c "import tiktoken; assert tiktoken.encoding_for_model('gpt-4o').encode('hello')" \
+    && test -n "$(ls -A /app/.tiktoken-cache)" && echo "tokenizer pre-cached"
 
 # Create non-root user for security
-RUN useradd --create-home --shell /bin/bash appuser && \
+RUN useradd --create-home --shell /usr/sbin/nologin appuser && \
     chown -R appuser:appuser /app
 USER appuser
 
-# Expose port
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+# Health check via stdlib (no curl needed in the image); honors PROXY_BIND_PORT
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import os,urllib.request,sys; port=os.getenv('PROXY_BIND_PORT','8080'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=4).status==200 else 1)" || exit 1
 
-# Run the application
-CMD ["python", "rotator.py"]
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "rotator:app"]

@@ -1,19 +1,26 @@
-version: '3.8'
-
 services:
   llm-rotator:
     build:
       context: .
       dockerfile: Dockerfile
+    image: llm-rotator:latest
     container_name: llm-rotator
     restart: unless-stopped
-    network_mode: host  # Required for Tailscale socks5 proxy access
+    # Required: Tailscale's 100.64.x.x SOCKS5 endpoints are unreachable from
+    # bridge networking. With host networking, PROXY_BIND_HOST=127.0.0.1 binds
+    # the HOST's loopback.
+    network_mode: host
     env_file:
       - .env
     environment:
-      - BIND_HOST=0.0.0.0  # Listen on all interfaces inside container
+      # The proxy has no built-in authentication: keep it on loopback unless
+      # you front it with an authenticating reverse proxy.
+      # NOTE: this overrides any PROXY_BIND_HOST from .env.
+      PROXY_BIND_HOST: 127.0.0.1
+      # PROXY_BIND_HOST: 0.0.0.0 exposes an UNAUTHENTICATED gateway on all host interfaces.
+      # PROXY_BIND_PORT comes from .env (default 8080 inside gunicorn.conf.py).
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4).status==200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -23,6 +30,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    # Optional: Mount local config if you want to override without rebuilding
-    # volumes:
-    #   - ./config.local.json:/app/config.local.json:ro

@@ -1,69 +1,12 @@
-# Tailscale LLM Proxy Rotator - Requirements
-
-Core dependencies for the secure proxy rotator with advanced token optimization.
-
-## Core Dependencies
-Flask>=2.3.0
-requests>=2.31.0
-
-## Token Counting (Recommended)
-tiktoken>=0.5.0
-
-## Advanced Semantic Compression (Optional)
-# Install LLMLingua for aggressive context compression (Stage 2)
-# Enable with: ENABLE_SEMANTIC_COMPRESSION=true
-llmlingua>=0.1.0
-
-## Optional Utilities
-# python-dotenv for automatic .env file loading
-# python-dotenv>=1.0.0
-
-## Installation
-
-### Basic Installation (token counting only)
-```bash
-pip install flask requests tiktoken
-```
-
-### Full Installation (with semantic compression)
-```bash
-pip install flask requests tiktoken llmlingua
-```
-
-### Using requirements file
-```bash
-# Basic
-pip install -r requirements.txt
-
-# With all optional dependencies
-pip install flask requests tiktoken llmlingua python-dotenv
-```
-
-## Environment Configuration
-
-See `.env.example` for configuration template. Key optimization flags:
-
-```bash
-# Enable/disable entire pipeline
-ENABLE_CONTEXT_COMPRESSION=true
-
-# Stage 1: Structural hygiene (default: on)
-REMOVE_DUPLICATE_MESSAGES=true
-STRIP_WHITESPACE=true
-
-# Stage 2: Semantic compression (default: off, requires llmlingua)
-ENABLE_SEMANTIC_COMPRESSION=false
-SEMANTIC_COMPRESSION_RATIO=0.5
-
-# Stage 3: Prompt caching (default: off)
-ENABLE_PROMPT_CACHING=false
-PROMPT_CACHE_TTL=300
-
-# Stage 4: Importance scoring (default: off)
-ENABLE_IMPORTANCE_SCORING=false
-MIN_MESSAGE_IMPORTANCE=0.3
-
-# Stage 5: Recursive summarization (default: off)
-ENABLE_RECURSIVE_SUMMARIZATION=false
-SUMMARIZATION_MODEL=gpt-4o-mini
-```
+# Runtime dependencies for the LLM rotator proxy.
+#
+# Pinned for reproducible builds (this file feeds the Docker image).
+# Bump deliberately: re-run `python -m pytest tests/` after any change.
+#
+# Optional extras NOT included here:
+#   llmlingua  - semantic compression stage; pulls in torch (~2GB).
+#                Enable with ENABLE_SEMANTIC_COMPRESSION=true after installing it.
+flask==3.1.3
+gunicorn==26.1.0
+requests==2.34.2
+tiktoken==0.14.0
