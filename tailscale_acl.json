@@ -1,0 +1,30 @@
+# Tailscale ACL Configuration for LLM Proxy Rotator
+# ===================================================
+# Add this configuration to your Tailscale Admin Console ACL JSON
+# to lock down proxy endpoints to authorized clients only.
+
+{
+  "tags": {
+    "tag:llm-client": ["admin@yourdomain.com"],
+    "tag:proxy-nodes": ["admin@yourdomain.com"]
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["tag:llm-client"],
+      "dst": ["tag:proxy-nodes:1055"]
+    }
+  ]
+}
+
+## Setup Instructions:
+# 1. Replace "admin@yourdomain.com" with your actual Tailscale user email
+# 2. Copy this entire block into your Tailscale Admin Console → Settings → ACLs
+# 3. On each of your four gateway nodes, run:
+#    tailscaled --socks5-server=0.0.0.0:1055
+#
+# 4. Verify the SOCKS5 proxy is listening:
+#    netstat -tlnp | grep 1055
+#
+# 5. Test connectivity from your client machine:
+#    curl --socks5-hostname 100.64.0.1:1055 https://api.openai.com/v1/models

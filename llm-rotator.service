@@ -1,0 +1,32 @@
+[Unit]
+Description=Secure LLM Proxy Rotator with Tailscale Integration
+Documentation=https://github.com/your-org/llm-proxy-rotator
+After=network.target tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+Type=simple
+User=your-username
+Group=your-username
+WorkingDirectory=/opt/llm-rotator
+ExecStart=/usr/bin/python3 /opt/llm-rotator/rotator.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llm-rotator
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/log/llm-rotator
+
+# Environment variables (optional - override defaults)
+Environment="TARGET_PROVIDER_URL=https://api.openai.com/v1"
+Environment="BIND_PORT=8080"
+Environment="MAX_RETRIES=4"
+
+[Install]
+WantedBy=multi-user.target
