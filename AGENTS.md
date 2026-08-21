@@ -54,6 +54,10 @@ Production runs use gunicorn (`gunicorn.conf.py`, gthread workers): `gunicorn -c
 
 ## Agent skills
 
+### Implementation workflow
+
+Before committing anything, opening a PR, or merging: follow the gated implementation workflow. See `docs/agents/implementation-workflow.md`.
+
 ### Issue tracker
 
 Issues live in GitHub Issues at ZeroClue/llm-rotator via the `gh` CLI. See `docs/agents/issue-tracker.md`.
