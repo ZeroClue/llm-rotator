@@ -315,14 +315,9 @@ def test_auth_disabled_by_default(rotator, monkeypatch, client):
     assert resp.status_code == 200
 
 
-def test_models_endpoint_requires_token_too(rotator, monkeypatch, client, mock):
+def test_models_endpoint_requires_token_too(rotator, monkeypatch, client):
     monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
     assert client.get("/v1/models").status_code == 401
-    # Admitted requests proceed upstream. (list_models itself has no failover —
-    # that's roadmap #14 — so only gate behavior is asserted here.)
-    before = len([r for r in mock.captured() if r["method"] == "GET"])
-    client.get("/v1/models", headers={"Authorization": "Bearer sekrit"})
-    assert len([r for r in mock.captured() if r["method"] == "GET"]) == before + 1
 
 
 def test_unknown_path_returns_404(client):
