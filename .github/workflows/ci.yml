@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Bytecode compile check
+        run: python3 -m py_compile rotator.py
+
+      - name: Test suite
+        run: python3 -m pytest tests/ -v
+
+      - name: Docker build
+        run: docker build -t llm-rotator:ci .
+
+      - name: Container smoke test (/health)
+        run: |
+          docker run -d --rm --name llm-rotator \
+            -e PROXY_1_URL=socks5h://127.0.0.1:9 \
+            -e API_KEY_1=dummy \
+            -p 127.0.0.1:8080:8080 \
+            llm-rotator:ci
+          curl --fail --silent --show-error \
+            --retry 15 --retry-delay 1 --retry-connrefused --retry-all-errors \
+            http://127.0.0.1:8080/health
+          docker stop llm-rotator
