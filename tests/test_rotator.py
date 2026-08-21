@@ -16,6 +16,16 @@ BASIC_MESSAGES = [
 ]
 
 
+class FakeClock:
+    """Stepped virtual clock: time moves only when advance() is called."""
+
+    def __init__(self, start=0.0):
+        self.now = float(start)
+
+    def advance(self, seconds):
+        self.now += float(seconds)
+
+
 def test_health_reports_node_state(client):
     resp = client.get("/health")
     assert resp.status_code == 200
@@ -179,21 +189,53 @@ def test_compute_backoff_bounds(rotator, monkeypatch):
     assert rotator.compute_backoff(3, None) >= rotator.compute_backoff(0, None)
 
 
+def test_compute_backoff_jitter_is_injectable(rotator, monkeypatch):
+    monkeypatch.setattr(rotator, "RETRY_BACKOFF_BASE", 0.5)
+    monkeypatch.setattr(rotator, "RETRY_BACKOFF_MAX", 8.0)
+
+    def stub(lo, hi):
+        return hi / 4  # deterministic quarter of the jitter band
+
+    assert rotator.compute_backoff(0, None, rng=stub) == 0.625  # 0.5·2⁰ + 0.125
+    assert rotator.compute_backoff(1, None, rng=stub) == 1.125  # 0.5·2¹ + 0.125
+    assert rotator.compute_backoff(5, None, rng=stub) == 8.0  # capped
+    assert rotator.compute_backoff(0, 2.0, rng=stub) == 2.0  # Retry-After ignores jitter
+
+
 def test_cooldown_skips_recently_failed_node(rotator, monkeypatch):
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_BASE", 0.05)
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_MAX", 0.2)
-    import time
+    monkeypatch.setattr(rotator, "NODE_COOLDOWN_BASE", 30)
+    monkeypatch.setattr(rotator, "NODE_COOLDOWN_MAX", 300)
+    clock = FakeClock(start=100.0)
 
     it = rotator.ThreadSafeIterator([
         {"proxy": "p1", "api_key": "k1", "node_id": 1},
         {"proxy": "p2", "api_key": "k2", "node_id": 2},
     ])
-    first = it.get_next()
+    first = it.get_next(now=clock.now)
     assert first["node_id"] == 1
-    it.report_failure(first)
-    assert [it.get_next()["node_id"] for _ in range(3)] == [2, 2, 2]
-    time.sleep(0.12)
-    assert it.get_next()["node_id"] in (1, 2)
+    it.report_failure(first, now=clock.now)
+    assert [it.get_next(now=clock.now)["node_id"] for _ in range(3)] == [2, 2, 2]
+    clock.advance(29)  # cooldown deadline is t=130; still cooling at t=129
+    assert it.get_next(now=clock.now)["node_id"] == 2
+    clock.advance(2)  # t=131, past the deadline
+    assert it.get_next(now=clock.now)["node_id"] == 1
+
+
+def test_never_starves_when_all_nodes_are_cooling(rotator, monkeypatch):
+    monkeypatch.setattr(rotator, "NODE_COOLDOWN_BASE", 30)
+    monkeypatch.setattr(rotator, "NODE_COOLDOWN_MAX", 300)
+    clock = FakeClock(start=100.0)
+
+    it = rotator.ThreadSafeIterator([
+        {"proxy": "p1", "api_key": "k1", "node_id": 1},
+        {"proxy": "p2", "api_key": "k2", "node_id": 2},
+    ])
+    node1 = it.get_next(now=clock.now)
+    it.report_failure(node1, now=clock.now)
+    node2 = it.get_next(now=clock.now)
+    it.report_failure(node2, now=clock.now)
+    # Both nodes cooling: the never-starve rule serves the cursor node anyway.
+    assert [it.get_next(now=clock.now)["node_id"] for _ in range(2)] == [1, 2]
 
 
 def test_report_success_clears_cooldown(rotator, monkeypatch):
@@ -208,6 +250,24 @@ def test_report_success_clears_cooldown(rotator, monkeypatch):
     assert it.get_next()["node_id"] == 2
     it.report_success(node)
     assert it.get_next()["node_id"] == 1
+
+
+def test_snapshot_reports_remaining_cooldown(rotator, monkeypatch):
+    monkeypatch.setattr(rotator, "NODE_COOLDOWN_BASE", 30)
+    monkeypatch.setattr(rotator, "NODE_COOLDOWN_MAX", 300)
+    clock = FakeClock(start=100.0)
+
+    it = rotator.ThreadSafeIterator([
+        {"proxy": "p1", "api_key": "k1", "node_id": 1},
+        {"proxy": "p2", "api_key": "k2", "node_id": 2},
+    ])
+    node = it.get_next(now=clock.now)
+    it.report_failure(node, now=clock.now)
+    clock.advance(15)
+    snap = {e["node_id"]: e for e in it.snapshot(now=clock.now)}
+    assert snap[1]["consecutive_failures"] == 1
+    assert snap[1]["cooldown_seconds"] == 15.0  # 30s cooldown, 15s elapsed
+    assert snap[2]["cooldown_seconds"] == 0.0
 
 
 def test_unknown_path_returns_404(client):

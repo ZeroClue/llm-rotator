@@ -39,10 +39,13 @@ can't distinguish "process up" from "service usable". Data already exists in
 *Acceptance:* kill all node targets, `/ready` flips to 503 within one cooldown
 window; `/health` unchanged shape otherwise.
 
-### 13. Deterministic clock/sleeper seams — `todo`
+### 13. Deterministic clock/sleeper seams — `done` (2026-08-21)
 Pass clock/sleeper/rng as plain parameters into the timing code
-(`time.monotonic` at rotator.py:214/255/265, `time.sleep` at :1006,
-`random.uniform` at :91); stdlib functions remain the production adapters.
+(`time.monotonic` at rotator.py:215/257/269, `random.uniform` at :91); stdlib
+functions remain the production adapters.
+Amendment: `time.sleep` at :1006 was **deferred to item 14** — a Flask view can't
+take injected parameters, and #14's send-result interface is the natural home for
+sleeper injection. Nothing asserts on that sleep today.
 *Rationale:* cooldown expiry is currently tested by really sleeping 0.12 s and
 asserting a range (`index in (1, 2)`) — slow and scheduler-dependent; backoff
 bounds are inequality-only because jitter is unseedable. Prerequisite for clean

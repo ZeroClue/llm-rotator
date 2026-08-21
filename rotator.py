@@ -85,10 +85,10 @@ def parse_retry_after(value):
     return seconds if seconds >= 0 else None
 
 
-def compute_backoff(attempt, retry_after=None):
+def compute_backoff(attempt, retry_after=None, rng=random.uniform):
     if retry_after is not None:
         return min(retry_after, RETRY_BACKOFF_MAX)
-    delay = RETRY_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, RETRY_BACKOFF_BASE)
+    delay = RETRY_BACKOFF_BASE * (2 ** attempt) + rng(0, RETRY_BACKOFF_BASE)
     return min(delay, RETRY_BACKOFF_MAX)
 
 # Token optimization settings
@@ -209,9 +209,10 @@ class ThreadSafeIterator:
             entry.setdefault("consecutive_failures", 0)
             entry.setdefault("fail_until", 0.0)
 
-    def get_next(self):
+    def get_next(self, now=None):
         """Atomically select the next usable node and advance the cursor."""
-        now = time.monotonic()
+        if now is None:
+            now = time.monotonic()
         with self.lock:
             n = len(self.pool)
             chosen = None
@@ -242,7 +243,7 @@ class ThreadSafeIterator:
                 entry["consecutive_failures"] = 0
                 entry["fail_until"] = 0.0
 
-    def report_failure(self, node):
+    def report_failure(self, node, now=None):
         with self.lock:
             entry = self._find(node)
             if entry is None:
@@ -252,7 +253,9 @@ class ThreadSafeIterator:
                 NODE_COOLDOWN_MAX,
                 NODE_COOLDOWN_BASE * (2 ** (entry["consecutive_failures"] - 1)),
             )
-            entry["fail_until"] = time.monotonic() + cooldown
+            if now is None:
+                now = time.monotonic()
+            entry["fail_until"] = now + cooldown
 
     def clear_failures(self):
         with self.lock:
@@ -260,9 +263,10 @@ class ThreadSafeIterator:
                 entry["consecutive_failures"] = 0
                 entry["fail_until"] = 0.0
 
-    def snapshot(self):
+    def snapshot(self, now=None):
         """Public view of node state for health checks (never includes keys)."""
-        now = time.monotonic()
+        if now is None:
+            now = time.monotonic()
         with self.lock:
             return [{
                 "node_id": e["node_id"],
