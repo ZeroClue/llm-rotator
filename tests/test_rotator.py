@@ -273,7 +273,6 @@ def test_snapshot_reports_remaining_cooldown(rotator, monkeypatch):
 def test_unknown_path_returns_404(client):
     resp = client.get("/definitely/not/here")
     assert resp.status_code == 404
-    assert False  # deliberate CI-red acceptance demo, reverted next commit
 
 
 def test_streamed_response_headers_are_sanitized(client):
