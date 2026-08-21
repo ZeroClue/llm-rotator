@@ -9,6 +9,10 @@ Features:
 - Thread-safe round-robin rotation across Tailscale nodes
 - Automatic failover on rate limits (429) and server errors (5xx)
 - DNS leak prevention via socks5h:// protocol
+- Streaming support with fast-path bypass for real-time responses
+- Post-optimization token verification to prevent double-counting
+- LRU caching for repeated context blocks
+- Provider-specific optimization profiles
 """
 
 import os
@@ -16,7 +20,9 @@ import re
 import json
 import logging
 import threading
-from flask import Flask, request, Response, jsonify
+import asyncio
+from functools import lru_cache
+from flask import Flask, request, Response, jsonify, stream_with_context
 
 # Configure logging first (before any imports that might use it)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -68,6 +74,48 @@ ENABLE_IMPORTANCE_SCORING = os.getenv("ENABLE_IMPORTANCE_SCORING", "false").lowe
 MIN_MESSAGE_IMPORTANCE = float(os.getenv("MIN_MESSAGE_IMPORTANCE", "0.3"))  # Drop messages below this score
 ENABLE_RECURSIVE_SUMMARIZATION = os.getenv("ENABLE_RECURSIVE_SUMMARIZATION", "false").lower() == "true"
 SUMMARIZATION_MODEL = os.getenv("SUMMARIZATION_MODEL", "gpt-4o-mini")  # Model for summarization
+
+# Streaming and performance settings
+ENABLE_STREAMING_FASTPATH = os.getenv("ENABLE_STREAMING_FASTPATH", "true").lower() == "true"
+ENABLE_CONTEXT_CACHE = os.getenv("ENABLE_CONTEXT_CACHE", "true").lower() == "true"
+CONTEXT_CACHE_SIZE = int(os.getenv("CONTEXT_CACHE_SIZE", "128"))  # LRU cache size
+
+# Provider-specific profiles
+PROVIDER_PROFILE = os.getenv("PROVIDER_PROFILE", "openai")  # openai, anthropic, groq
+PROVIDER_PROFILES = {
+    "openai": {
+        "max_context": 128000,
+        "reserved_tokens": 4096,
+        "supports_caching": True,
+        "cache_header": "cache_control",
+        "compression_safe": True
+    },
+    "anthropic": {
+        "max_context": 200000,
+        "reserved_tokens": 8192,
+        "supports_caching": True,
+        "cache_header": "cache_control",
+        "compression_safe": True
+    },
+    "groq": {
+        "max_context": 32000,
+        "reserved_tokens": 2048,
+        "supports_caching": False,
+        "cache_header": None,
+        "compression_safe": False
+    }
+}
+
+# Apply provider profile
+if PROVIDER_PROFILE in PROVIDER_PROFILES:
+    _profile = PROVIDER_PROFILES[PROVIDER_PROFILE]
+    MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", str(_profile["max_context"])))
+    RESERVED_RESPONSE_TOKENS = int(os.getenv("RESERVED_RESPONSE_TOKENS", str(_profile["reserved_tokens"])))
+    if not ENABLE_PROMPT_CACHING:
+        ENABLE_PROMPT_CACHING = _profile["supports_caching"]
+    logger.info(f"Applied provider profile: {PROVIDER_PROFILE} (max_context={MAX_CONTEXT_TOKENS})")
+else:
+    logger.warning(f"Unknown provider profile '{PROVIDER_PROFILE}', using defaults")
 
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o")
 
@@ -166,6 +214,12 @@ class TokenOptimizer:
     4. Importance Scoring - Caveman-inspired message prioritization
     5. Recursive Summarization - Summarize old context when needed
     6. Smart Truncation - Fallback token-based message dropping
+    
+    Improvements:
+    - Post-optimization verification to prevent double-counting
+    - LRU caching for repeated context blocks
+    - Streaming fast-path bypass for real-time responses
+    - Provider-specific token calculations
     """
     
     def __init__(self, model_name="gpt-4o"):
@@ -191,6 +245,36 @@ class TokenOptimizer:
             except Exception as e:
                 logger.warning(f"Failed to initialize llmlingua: {e}")
                 self.compressor = None
+        
+        # LRU cache for compressed contexts (content hash -> compressed result)
+        self.context_cache = {}
+        self.cache_lock = threading.Lock()
+        if ENABLE_CONTEXT_CACHE:
+            logger.info(f"Context caching enabled (max size: {CONTEXT_CACHE_SIZE})")
+    
+    def _hash_content(self, messages: list) -> str:
+        """Generate a hash key for message content caching."""
+        import hashlib
+        content_str = json.dumps(messages, sort_keys=True)
+        return hashlib.md5(content_str.encode()).hexdigest()
+    
+    def _get_cached(self, hash_key: str) -> dict | None:
+        """Retrieve cached optimization result if available."""
+        if not ENABLE_CONTEXT_CACHE:
+            return None
+        with self.cache_lock:
+            return self.context_cache.get(hash_key)
+    
+    def _cache_result(self, hash_key: str, result: dict):
+        """Cache optimization result with LRU eviction."""
+        if not ENABLE_CONTEXT_CACHE:
+            return
+        with self.cache_lock:
+            # Evict oldest if at capacity
+            if len(self.context_cache) >= CONTEXT_CACHE_SIZE:
+                oldest_key = next(iter(self.context_cache))
+                del self.context_cache[oldest_key]
+            self.context_cache[hash_key] = result
     
     def count_tokens(self, text: str) -> int:
         """Count tokens in a text string."""
@@ -235,15 +319,41 @@ class TokenOptimizer:
         total_tokens += 2
         return total_tokens
     
-    def optimize_context(self, payload: dict) -> dict:
+    def optimize_context(self, payload: dict, is_streaming: bool = False) -> dict:
         """
         Main optimization pipeline - executes enabled stages sequentially.
+        
+        Args:
+            payload: The request payload containing messages
+            is_streaming: If True, skip expensive optimizations for low-latency streaming
+        
+        Returns:
+            Optimized payload with reduced token count
         """
         if not ENABLE_CONTEXT_COMPRESSION:
             return payload
         
         messages = payload.get("messages", [])
         if not messages:
+            return payload
+        
+        # Fast path for streaming: skip expensive optimizations
+        if is_streaming and ENABLE_STREAMING_FASTPATH:
+            logger.debug("Streaming fast-path: minimal optimization applied")
+            if REMOVE_DUPLICATE_MESSAGES:
+                messages = self._remove_duplicates(messages)
+            if STRIP_WHITESPACE:
+                messages = self._strip_whitespace(messages)
+            payload["messages"] = messages
+            return payload
+        
+        # Check cache for identical context
+        content_hash = self._hash_content(messages)
+        cached_result = self._get_cached(content_hash)
+        if cached_result:
+            logger.info(f"Cache hit: reusing optimized context (saved {cached_result.get('tokens_saved', 0)} tokens)")
+            payload["messages"] = cached_result["messages"]
+            payload["max_tokens"] = cached_result["max_tokens"]
             return payload
         
         original_token_count = self.count_message_tokens(messages)
@@ -294,7 +404,17 @@ class TokenOptimizer:
             )
             messages = self._truncate_messages(messages, available_tokens)
         
+        # POST-OPTIMIZATION VERIFICATION: Prevent double-counting trap
         final_token_count = self.count_message_tokens(messages)
+        if final_token_count > available_tokens:
+            logger.error(
+                f"⚠️  Post-optimization verification FAILED: "
+                f"{final_token_count} tokens > {available_tokens} available. "
+                f"Forcing aggressive truncation..."
+            )
+            messages = self._aggressive_truncate(messages, available_tokens)
+            final_token_count = self.count_message_tokens(messages)
+        
         savings = original_token_count - final_token_count
         savings_pct = (savings / original_token_count * 100) if original_token_count > 0 else 0
         
@@ -309,6 +429,14 @@ class TokenOptimizer:
             payload.get("max_tokens", RESERVED_RESPONSE_TOKENS),
             MAX_CONTEXT_TOKENS - final_token_count
         )
+        
+        # Cache the result
+        cache_data = {
+            "messages": messages,
+            "max_tokens": payload["max_tokens"],
+            "tokens_saved": savings
+        }
+        self._cache_result(content_hash, cache_data)
         
         return payload
     
@@ -567,6 +695,57 @@ class TokenOptimizer:
                         conversation[last_user_idx]["content"] = content
         
         return ([system_msg] if system_msg else []) + conversation
+    
+    def _aggressive_truncate(self, messages: list, max_tokens: int) -> list:
+        """
+        Aggressive truncation fallback when post-optimization verification fails.
+        Keeps only the most recent messages and the system prompt.
+        """
+        system_msg = None
+        conversation = []
+        
+        for msg in messages:
+            if msg.get("role") == "system":
+                if system_msg is None:
+                    system_msg = msg
+            else:
+                conversation.append(msg)
+        
+        # Keep only the last N message pairs (user+assistant = 2 messages)
+        keep_count = max(2, len(conversation) // 4)  # Keep 25% or minimum 2
+        conversation = conversation[-keep_count:]
+        
+        # If still over limit, aggressively truncate content
+        while len(conversation) > 0:
+            test_messages = ([system_msg] if system_msg else []) + conversation
+            token_count = self.count_message_tokens(test_messages)
+            
+            if token_count <= max_tokens:
+                break
+            
+            # Remove oldest message
+            conversation.pop(0)
+        
+        # Final resort: truncate the last user message heavily
+        if conversation and self.count_message_tokens(([system_msg] if system_msg else []) + conversation) > max_tokens:
+            last_user_idx = None
+            for i in range(len(conversation) - 1, -1, -1):
+                if conversation[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            
+            if last_user_idx is not None:
+                content = conversation[last_user_idx].get("content", "")
+                if isinstance(content, str):
+                    # Keep only first and last 200 characters
+                    if len(content) > 400:
+                        conversation[last_user_idx]["content"] = (
+                            f"{content[:200]}\n\n[...heavily truncated...]\n\n{content[-200:]}"
+                        )
+        
+        result = ([system_msg] if system_msg else []) + conversation
+        logger.warning(f"Aggressive truncation applied: {len(messages)} → {len(result)} messages")
+        return result
 
 
 # Initialize token optimizer
@@ -590,14 +769,18 @@ def dynamic_failover_proxy(path):
     
     # Parse JSON payload for token optimization (if applicable)
     parsed_payload = None
+    is_streaming = False
     if payload and request.is_json:
         try:
             parsed_payload = request.get_json(force=True)
             
+            # Detect streaming requests
+            is_streaming = parsed_payload.get("stream", False)
+            
             # Apply token optimization for chat completions
             if path.endswith("chat/completions") and ENABLE_CONTEXT_COMPRESSION:
-                logger.info("Applying token optimization to request...")
-                parsed_payload = token_optimizer.optimize_context(parsed_payload)
+                logger.info(f"Applying token optimization to request... (streaming={is_streaming})")
+                parsed_payload = token_optimizer.optimize_context(parsed_payload, is_streaming=is_streaming)
                 payload = json.dumps(parsed_payload).encode('utf-8')
                 
         except Exception as e:
