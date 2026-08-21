@@ -1,0 +1,39 @@
+# Docker build context
+.git
+.gitignore
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+README.md
+docs/
+
+# Testing
+tests/
+.pytest_cache/
+.coverage
+coverage.xml
+
+# Logs
+*.log
+
+# Local config overrides
+config.local.json

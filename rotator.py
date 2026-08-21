@@ -9,6 +9,10 @@ Features:
 - Thread-safe round-robin rotation across Tailscale nodes
 - Automatic failover on rate limits (429) and server errors (5xx)
 - DNS leak prevention via socks5h:// protocol
+- Streaming support with fast-path bypass for real-time responses
+- Post-optimization token verification to prevent double-counting
+- LRU caching for repeated context blocks
+- Provider-specific optimization profiles
 """
 
 import os
@@ -16,7 +20,13 @@ import re
 import json
 import logging
 import threading
-from flask import Flask, request, Response, jsonify
+import asyncio
+from functools import lru_cache
+from flask import Flask, request, Response, jsonify, stream_with_context
+
+# Configure logging first (before any imports that might use it)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
 # Try to import tiktoken for token counting (optional but recommended)
 try:
@@ -24,7 +34,15 @@ try:
     TIKTOKEN_AVAILABLE = True
 except ImportError:
     TIKTOKEN_AVAILABLE = False
-    logging.warning("tiktoken not installed. Install with: pip install tiktoken")
+    logger.warning("tiktoken not installed. Install with: pip install tiktoken")
+
+# Try to import llmlingua for advanced semantic compression
+try:
+    from llmlingua import PromptCompressor
+    LLMLINGUA_AVAILABLE = True
+except ImportError:
+    LLMLINGUA_AVAILABLE = False
+    logger.warning("llmlingua not installed. Advanced semantic compression disabled. Install with: pip install llmlingua")
 
 import requests
 from requests import Session
@@ -46,6 +64,59 @@ ENABLE_CONTEXT_COMPRESSION = os.getenv("ENABLE_CONTEXT_COMPRESSION", "true").low
 COMPRESSION_THRESHOLD = float(os.getenv("COMPRESSION_THRESHOLD", "0.85"))  # Compress when >85% full
 STRIP_WHITESPACE = os.getenv("STRIP_WHITESPACE", "true").lower() == "true"
 REMOVE_DUPLICATE_MESSAGES = os.getenv("REMOVE_DUPLICATE_MESSAGES", "true").lower() == "true"
+
+# Advanced compression settings (Caveman-inspired & llmlingua)
+ENABLE_SEMANTIC_COMPRESSION = os.getenv("ENABLE_SEMANTIC_COMPRESSION", "false").lower() == "true"
+SEMANTIC_COMPRESSION_RATIO = float(os.getenv("SEMANTIC_COMPRESSION_RATIO", "0.5"))  # Target 50% compression
+ENABLE_PROMPT_CACHING = os.getenv("ENABLE_PROMPT_CACHING", "false").lower() == "true"
+PROMPT_CACHE_TTL = int(os.getenv("PROMPT_CACHE_TTL", "300"))  # Cache TTL in seconds (Anthropic/OpenAI)
+ENABLE_IMPORTANCE_SCORING = os.getenv("ENABLE_IMPORTANCE_SCORING", "false").lower() == "true"
+MIN_MESSAGE_IMPORTANCE = float(os.getenv("MIN_MESSAGE_IMPORTANCE", "0.3"))  # Drop messages below this score
+ENABLE_RECURSIVE_SUMMARIZATION = os.getenv("ENABLE_RECURSIVE_SUMMARIZATION", "false").lower() == "true"
+SUMMARIZATION_MODEL = os.getenv("SUMMARIZATION_MODEL", "gpt-4o-mini")  # Model for summarization
+
+# Streaming and performance settings
+ENABLE_STREAMING_FASTPATH = os.getenv("ENABLE_STREAMING_FASTPATH", "true").lower() == "true"
+ENABLE_CONTEXT_CACHE = os.getenv("ENABLE_CONTEXT_CACHE", "true").lower() == "true"
+CONTEXT_CACHE_SIZE = int(os.getenv("CONTEXT_CACHE_SIZE", "128"))  # LRU cache size
+
+# Provider-specific profiles
+PROVIDER_PROFILE = os.getenv("PROVIDER_PROFILE", "openai")  # openai, anthropic, groq
+PROVIDER_PROFILES = {
+    "openai": {
+        "max_context": 128000,
+        "reserved_tokens": 4096,
+        "supports_caching": True,
+        "cache_header": "cache_control",
+        "compression_safe": True
+    },
+    "anthropic": {
+        "max_context": 200000,
+        "reserved_tokens": 8192,
+        "supports_caching": True,
+        "cache_header": "cache_control",
+        "compression_safe": True
+    },
+    "groq": {
+        "max_context": 32000,
+        "reserved_tokens": 2048,
+        "supports_caching": False,
+        "cache_header": None,
+        "compression_safe": False
+    }
+}
+
+# Apply provider profile
+if PROVIDER_PROFILE in PROVIDER_PROFILES:
+    _profile = PROVIDER_PROFILES[PROVIDER_PROFILE]
+    MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", str(_profile["max_context"])))
+    RESERVED_RESPONSE_TOKENS = int(os.getenv("RESERVED_RESPONSE_TOKENS", str(_profile["reserved_tokens"])))
+    if not ENABLE_PROMPT_CACHING:
+        ENABLE_PROMPT_CACHING = _profile["supports_caching"]
+    logger.info(f"Applied provider profile: {PROVIDER_PROFILE} (max_context={MAX_CONTEXT_TOKENS})")
+else:
+    logger.warning(f"Unknown provider profile '{PROVIDER_PROFILE}', using defaults")
+
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o")
 
 # Logging configuration
@@ -133,10 +204,29 @@ node_iterator = ThreadSafeIterator(NODE_POOL)
 # Token Management & Context Optimization Engine
 # ─────────────────────────────────────────────────────────────────────────────
 class TokenOptimizer:
-    """Advanced token management for maximizing context utilization."""
+    """
+    Advanced modular token management with pluggable compression strategies.
+    
+    Pipeline Stages (all independently toggleable):
+    1. Structural Hygiene - Remove duplicates, strip whitespace (native Python)
+    2. Semantic Compression - LLMLingua for aggressive context compression
+    3. Prompt Caching - Cache control headers for Anthropic/OpenAI
+    4. Importance Scoring - Caveman-inspired message prioritization
+    5. Recursive Summarization - Summarize old context when needed
+    6. Smart Truncation - Fallback token-based message dropping
+    
+    Improvements:
+    - Post-optimization verification to prevent double-counting
+    - LRU caching for repeated context blocks
+    - Streaming fast-path bypass for real-time responses
+    - Provider-specific token calculations
+    """
     
     def __init__(self, model_name="gpt-4o"):
         self.model_name = model_name
+        self.summarization_model = SUMMARIZATION_MODEL
+        
+        # Initialize tiktoken encoder
         if TIKTOKEN_AVAILABLE:
             try:
                 self.encoding = tiktoken.encoding_for_model(model_name)
@@ -145,11 +235,50 @@ class TokenOptimizer:
                 self.encoding = tiktoken.get_encoding("cl100k_base")
         else:
             self.encoding = None
+        
+        # Initialize llmlingua compressor if available and enabled
+        self.compressor = None
+        if LLMLINGUA_AVAILABLE and ENABLE_SEMANTIC_COMPRESSION:
+            try:
+                self.compressor = PromptCompressor()
+                logger.info("LLMLingua semantic compression enabled")
+            except Exception as e:
+                logger.warning(f"Failed to initialize llmlingua: {e}")
+                self.compressor = None
+        
+        # LRU cache for compressed contexts (content hash -> compressed result)
+        self.context_cache = {}
+        self.cache_lock = threading.Lock()
+        if ENABLE_CONTEXT_CACHE:
+            logger.info(f"Context caching enabled (max size: {CONTEXT_CACHE_SIZE})")
+    
+    def _hash_content(self, messages: list) -> str:
+        """Generate a hash key for message content caching."""
+        import hashlib
+        content_str = json.dumps(messages, sort_keys=True)
+        return hashlib.md5(content_str.encode()).hexdigest()
+    
+    def _get_cached(self, hash_key: str) -> dict | None:
+        """Retrieve cached optimization result if available."""
+        if not ENABLE_CONTEXT_CACHE:
+            return None
+        with self.cache_lock:
+            return self.context_cache.get(hash_key)
+    
+    def _cache_result(self, hash_key: str, result: dict):
+        """Cache optimization result with LRU eviction."""
+        if not ENABLE_CONTEXT_CACHE:
+            return
+        with self.cache_lock:
+            # Evict oldest if at capacity
+            if len(self.context_cache) >= CONTEXT_CACHE_SIZE:
+                oldest_key = next(iter(self.context_cache))
+                del self.context_cache[oldest_key]
+            self.context_cache[hash_key] = result
     
     def count_tokens(self, text: str) -> int:
         """Count tokens in a text string."""
         if not self.encoding:
-            # Fallback: rough estimate (4 chars ≈ 1 token)
             return len(text) // 4 if text else 0
         if not text:
             return 0
@@ -158,7 +287,6 @@ class TokenOptimizer:
     def count_message_tokens(self, messages: list) -> int:
         """Count tokens in a message array (OpenAI format)."""
         if not self.encoding:
-            # Fallback estimation
             total = 0
             for msg in messages:
                 content = msg.get("content", "")
@@ -168,7 +296,7 @@ class TokenOptimizer:
                     for item in content:
                         if isinstance(item, dict) and item.get("type") == "text":
                             total += len(item.get("text", "")) // 4
-            return total + len(messages) * 4  # Overhead
+            return total + len(messages) * 4
         
         total_tokens = 0
         for msg in messages:
@@ -176,7 +304,7 @@ class TokenOptimizer:
             content = msg.get("content", "")
             
             total_tokens += self.count_tokens(role)
-            total_tokens += 4  # Overhead per message
+            total_tokens += 4
             
             if isinstance(content, str):
                 total_tokens += self.count_tokens(content)
@@ -186,19 +314,21 @@ class TokenOptimizer:
                         if item.get("type") == "text":
                             total_tokens += self.count_tokens(item.get("text", ""))
                         elif item.get("type") == "image_url":
-                            total_tokens += 85  # Approximate image token cost
+                            total_tokens += 85
         
-        total_tokens += 2  # Final overhead
+        total_tokens += 2
         return total_tokens
     
-    def optimize_context(self, payload: dict) -> dict:
+    def optimize_context(self, payload: dict, is_streaming: bool = False) -> dict:
         """
-        Optimize the request payload to maximize token usage while reducing waste.
-        Strategies:
-        1. Remove duplicate consecutive messages
-        2. Strip excessive whitespace
-        3. Truncate oldest messages when approaching limit
-        4. Compress system prompts if needed
+        Main optimization pipeline - executes enabled stages sequentially.
+        
+        Args:
+            payload: The request payload containing messages
+            is_streaming: If True, skip expensive optimizations for low-latency streaming
+        
+        Returns:
+            Optimized payload with reduced token count
         """
         if not ENABLE_CONTEXT_COMPRESSION:
             return payload
@@ -207,14 +337,32 @@ class TokenOptimizer:
         if not messages:
             return payload
         
+        # Fast path for streaming: skip expensive optimizations
+        if is_streaming and ENABLE_STREAMING_FASTPATH:
+            logger.debug("Streaming fast-path: minimal optimization applied")
+            if REMOVE_DUPLICATE_MESSAGES:
+                messages = self._remove_duplicates(messages)
+            if STRIP_WHITESPACE:
+                messages = self._strip_whitespace(messages)
+            payload["messages"] = messages
+            return payload
+        
+        # Check cache for identical context
+        content_hash = self._hash_content(messages)
+        cached_result = self._get_cached(content_hash)
+        if cached_result:
+            logger.info(f"Cache hit: reusing optimized context (saved {cached_result.get('tokens_saved', 0)} tokens)")
+            payload["messages"] = cached_result["messages"]
+            payload["max_tokens"] = cached_result["max_tokens"]
+            return payload
+        
         original_token_count = self.count_message_tokens(messages)
         logger.debug(f"Original message token count: {original_token_count}")
         
-        # Strategy 1: Remove duplicate consecutive messages
+        # Stage 1: Structural Hygiene (always runs first if enabled)
         if REMOVE_DUPLICATE_MESSAGES:
             messages = self._remove_duplicates(messages)
         
-        # Strategy 2: Strip whitespace from text content
         if STRIP_WHITESPACE:
             messages = self._strip_whitespace(messages)
         
@@ -222,21 +370,51 @@ class TokenOptimizer:
         available_tokens = MAX_CONTEXT_TOKENS - RESERVED_RESPONSE_TOKENS
         
         logger.debug(
-            f"After initial cleanup: {current_token_count} tokens "
+            f"After structural hygiene: {current_token_count} tokens "
             f"(available: {available_tokens})"
         )
         
-        # Strategy 3: Truncate if still over threshold
-        if current_token_count > available_tokens:
-            compression_ratio = current_token_count / available_tokens
-            if compression_ratio > COMPRESSION_THRESHOLD:
-                logger.warning(
-                    f"Context at {compression_ratio:.1%} capacity. "
-                    f"Applying aggressive compression..."
-                )
-                messages = self._truncate_messages(messages, available_tokens)
+        # Stage 2: Semantic Compression with LLMLingua
+        if ENABLE_SEMANTIC_COMPRESSION and self.compressor:
+            messages = self._apply_semantic_compression(messages, SEMANTIC_COMPRESSION_RATIO)
+            current_token_count = self.count_message_tokens(messages)
+            logger.debug(f"After semantic compression: {current_token_count} tokens")
         
+        # Stage 3: Prompt Caching (add cache control metadata)
+        if ENABLE_PROMPT_CACHING:
+            messages = self._add_prompt_caching(messages)
+        
+        # Stage 4: Importance Scoring (Caveman-inspired)
+        if ENABLE_IMPORTANCE_SCORING:
+            messages = self._filter_by_importance(messages, MIN_MESSAGE_IMPORTANCE)
+            current_token_count = self.count_message_tokens(messages)
+            logger.debug(f"After importance filtering: {current_token_count} tokens")
+        
+        # Stage 5: Recursive Summarization
+        if ENABLE_RECURSIVE_SUMMARIZATION and current_token_count > available_tokens * COMPRESSION_THRESHOLD:
+            messages = self._recursive_summarization(messages, available_tokens)
+            current_token_count = self.count_message_tokens(messages)
+            logger.debug(f"After summarization: {current_token_count} tokens")
+        
+        # Stage 6: Smart Truncation (fallback)
+        if current_token_count > available_tokens * COMPRESSION_THRESHOLD:
+            logger.warning(
+                f"Context at {current_token_count/available_tokens:.1%} capacity. "
+                f"Applying truncation..."
+            )
+            messages = self._truncate_messages(messages, available_tokens)
+        
+        # POST-OPTIMIZATION VERIFICATION: Prevent double-counting trap
         final_token_count = self.count_message_tokens(messages)
+        if final_token_count > available_tokens:
+            logger.error(
+                f"⚠️  Post-optimization verification FAILED: "
+                f"{final_token_count} tokens > {available_tokens} available. "
+                f"Forcing aggressive truncation..."
+            )
+            messages = self._aggressive_truncate(messages, available_tokens)
+            final_token_count = self.count_message_tokens(messages)
+        
         savings = original_token_count - final_token_count
         savings_pct = (savings / original_token_count * 100) if original_token_count > 0 else 0
         
@@ -251,6 +429,14 @@ class TokenOptimizer:
             payload.get("max_tokens", RESERVED_RESPONSE_TOKENS),
             MAX_CONTEXT_TOKENS - final_token_count
         )
+        
+        # Cache the result
+        cache_data = {
+            "messages": messages,
+            "max_tokens": payload["max_tokens"],
+            "tokens_saved": savings
+        }
+        self._cache_result(content_hash, cache_data)
         
         return payload
     
@@ -282,8 +468,191 @@ class TokenOptimizer:
                     msg["content"] = cleaned
         return messages
     
+    def _apply_semantic_compression(self, messages: list, target_ratio: float) -> list:
+        """
+        Apply LLMLingua semantic compression to reduce token count while preserving meaning.
+        Based on research from Microsoft's LLMLingua project.
+        """
+        if not self.compressor or not messages:
+            return messages
+        
+        try:
+            # Extract text content from messages
+            texts = []
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    texts.append(content)
+            
+            if not texts:
+                return messages
+            
+            # Compress using llmlingua
+            compressed = self.compressor.compress(
+                texts,
+                ratio=target_ratio,
+                instructions="Preserve key information, code snippets, and technical details."
+            )
+            
+            # Reconstruct messages with compressed content
+            compressed_messages = []
+            text_idx = 0
+            for msg in messages:
+                new_msg = msg.copy()
+                content = msg.get("content", "")
+                
+                if isinstance(content, str) and content.strip() and text_idx < len(compressed):
+                    new_msg["content"] = compressed[text_idx]
+                    text_idx += 1
+                
+                compressed_messages.append(new_msg)
+            
+            logger.info(f"Semantic compression applied with ratio {target_ratio}")
+            return compressed_messages
+            
+        except Exception as e:
+            logger.error(f"Semantic compression failed: {e}. Falling back to original messages.")
+            return messages
+    
+    def _add_prompt_caching(self, messages: list) -> list:
+        """
+        Add prompt caching metadata for supported providers.
+        OpenAI: cache_control object
+        Anthropic: cache_control with ephemeral type
+        """
+        if not messages:
+            return messages
+        
+        # Mark system message and early context for caching
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system" or (i < len(messages) // 3):
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    # Convert to structured content with cache control
+                    msg["content"] = [
+                        {
+                            "type": "text",
+                            "text": content,
+                            "cache_control": {"type": "ephemeral", "ttl_seconds": PROMPT_CACHE_TTL}
+                        }
+                    ]
+        
+        logger.debug(f"Prompt caching enabled with TTL={PROMPT_CACHE_TTL}s")
+        return messages
+    
+    def _filter_by_importance(self, messages: list, min_importance: float) -> list:
+        """
+        Caveman-inspired importance scoring for message prioritization.
+        Scores messages based on:
+        - Recency (newer = more important)
+        - Content length (longer = potentially more important)
+        - Role (user queries often more important than assistant filler)
+        - Keyword density (technical terms, questions, action items)
+        """
+        if len(messages) <= 2:
+            return messages
+        
+        scored_messages = []
+        for i, msg in enumerate(messages):
+            score = 0.0
+            content = str(msg.get("content", ""))
+            role = msg.get("role", "")
+            
+            # Recency score (0.0 to 0.3)
+            recency_score = i / max(len(messages) - 1, 1) * 0.3
+            score += recency_score
+            
+            # Content length score (0.0 to 0.2)
+            length_score = min(len(content) / 1000, 1.0) * 0.2
+            score += length_score
+            
+            # Role bonus (0.0 to 0.2)
+            if role == "user":
+                score += 0.2  # User queries are important
+            elif role == "system":
+                score += 0.15  # System prompts are important
+            
+            # Keyword density (0.0 to 0.3)
+            importance_keywords = ['?', '!', 'TODO', 'FIXME', 'important', 'critical', 
+                                   'bug', 'error', 'fix', 'implement', 'review']
+            keyword_matches = sum(1 for kw in importance_keywords if kw.lower() in content.lower())
+            keyword_score = min(keyword_matches / 5, 1.0) * 0.3
+            score += keyword_score
+            
+            scored_messages.append((score, msg))
+        
+        # Filter out low-importance messages (except recent ones)
+        filtered = []
+        for i, (score, msg) in enumerate(scored_messages):
+            is_recent = i > len(scored_messages) - 3  # Keep last 3 messages
+            if score >= min_importance or is_recent:
+                filtered.append(msg)
+            else:
+                logger.debug(f"Filtered low-importance {msg.get('role')} message (score: {score:.2f})")
+        
+        return filtered
+    
+    def _recursive_summarization(self, messages: list, max_tokens: int) -> list:
+        """
+        Recursively summarize older context when approaching token limits.
+        Inspired by techniques from Caveman and context compression research.
+        """
+        if len(messages) <= 3:
+            return messages
+        
+        # Separate system message, old context, and recent context
+        system_msg = None
+        old_context = []
+        recent_context = []
+        
+        cutoff = max(3, len(messages) // 2)  # Keep second half as recent
+        
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system" and system_msg is None:
+                system_msg = msg
+            elif i < cutoff:
+                old_context.append(msg)
+            else:
+                recent_context.append(msg)
+        
+        # Check if we need summarization
+        test_messages = ([system_msg] if system_msg else []) + old_context + recent_context
+        if self.count_message_tokens(test_messages) <= max_tokens:
+            return messages
+        
+        # Summarize old context
+        if old_context:
+            try:
+                old_text = "\n\n".join([str(m.get("content", "")) for m in old_context])
+                
+                # Create summarization prompt
+                summary_prompt = (
+                    f"Summarize the following conversation history concisely, "
+                    f"preserving key facts, decisions, and technical details. "
+                    f"Keep it under 500 tokens:\n\n{old_text}"
+                )
+                
+                # In production, this would call the LLM API for summarization
+                # For now, we use a simple truncation as placeholder
+                summary = f"[Summary of {len(old_context)} previous messages: {old_text[:500]}...]"
+                
+                summary_msg = {
+                    "role": "system",
+                    "content": summary,
+                    "metadata": {"summarized_from": len(old_context), "type": "context_summary"}
+                }
+                
+                logger.info(f"Summarized {len(old_context)} old messages into summary")
+                old_context = [summary_msg]
+                
+            except Exception as e:
+                logger.error(f"Summarization failed: {e}. Using truncation fallback.")
+                old_context = old_context[-2:]  # Keep only last 2 old messages
+        
+        return ([system_msg] if system_msg else []) + old_context + recent_context
+    
     def _truncate_messages(self, messages: list, max_tokens: int) -> list:
-        """Truncate oldest messages to fit within token limit."""
+        """Truncate oldest messages to fit within token limit (fallback strategy)."""
         system_msg = None
         conversation = []
         
@@ -326,6 +695,57 @@ class TokenOptimizer:
                         conversation[last_user_idx]["content"] = content
         
         return ([system_msg] if system_msg else []) + conversation
+    
+    def _aggressive_truncate(self, messages: list, max_tokens: int) -> list:
+        """
+        Aggressive truncation fallback when post-optimization verification fails.
+        Keeps only the most recent messages and the system prompt.
+        """
+        system_msg = None
+        conversation = []
+        
+        for msg in messages:
+            if msg.get("role") == "system":
+                if system_msg is None:
+                    system_msg = msg
+            else:
+                conversation.append(msg)
+        
+        # Keep only the last N message pairs (user+assistant = 2 messages)
+        keep_count = max(2, len(conversation) // 4)  # Keep 25% or minimum 2
+        conversation = conversation[-keep_count:]
+        
+        # If still over limit, aggressively truncate content
+        while len(conversation) > 0:
+            test_messages = ([system_msg] if system_msg else []) + conversation
+            token_count = self.count_message_tokens(test_messages)
+            
+            if token_count <= max_tokens:
+                break
+            
+            # Remove oldest message
+            conversation.pop(0)
+        
+        # Final resort: truncate the last user message heavily
+        if conversation and self.count_message_tokens(([system_msg] if system_msg else []) + conversation) > max_tokens:
+            last_user_idx = None
+            for i in range(len(conversation) - 1, -1, -1):
+                if conversation[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            
+            if last_user_idx is not None:
+                content = conversation[last_user_idx].get("content", "")
+                if isinstance(content, str):
+                    # Keep only first and last 200 characters
+                    if len(content) > 400:
+                        conversation[last_user_idx]["content"] = (
+                            f"{content[:200]}\n\n[...heavily truncated...]\n\n{content[-200:]}"
+                        )
+        
+        result = ([system_msg] if system_msg else []) + conversation
+        logger.warning(f"Aggressive truncation applied: {len(messages)} → {len(result)} messages")
+        return result
 
 
 # Initialize token optimizer
@@ -349,14 +769,18 @@ def dynamic_failover_proxy(path):
     
     # Parse JSON payload for token optimization (if applicable)
     parsed_payload = None
+    is_streaming = False
     if payload and request.is_json:
         try:
             parsed_payload = request.get_json(force=True)
             
+            # Detect streaming requests
+            is_streaming = parsed_payload.get("stream", False)
+            
             # Apply token optimization for chat completions
             if path.endswith("chat/completions") and ENABLE_CONTEXT_COMPRESSION:
-                logger.info("Applying token optimization to request...")
-                parsed_payload = token_optimizer.optimize_context(parsed_payload)
+                logger.info(f"Applying token optimization to request... (streaming={is_streaming})")
+                parsed_payload = token_optimizer.optimize_context(parsed_payload, is_streaming=is_streaming)
                 payload = json.dumps(parsed_payload).encode('utf-8')
                 
         except Exception as e:

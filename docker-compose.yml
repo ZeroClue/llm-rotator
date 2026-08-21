@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  llm-rotator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-rotator
+    restart: unless-stopped
+    network_mode: host  # Required for Tailscale socks5 proxy access
+    env_file:
+      - .env
+    environment:
+      - BIND_HOST=0.0.0.0  # Listen on all interfaces inside container
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Optional: Mount local config if you want to override without rebuilding
+    # volumes:
+    #   - ./config.local.json:/app/config.local.json:ro
