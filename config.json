@@ -1,0 +1,11 @@
+{
+  "models": [
+    {
+      "title": "Tailscale Rotated LLM Pool",
+      "provider": "openai",
+      "model": "gpt-4o",
+      "apiBase": "http://127.0.0.1:8080/v1",
+      "apiKey": "managed-by-local-rotator-daemon"
+    }
+  ]
+}
