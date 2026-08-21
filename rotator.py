@@ -18,14 +18,21 @@ Features:
 import os
 import re
 import json
+import time
+import random
 import logging
 import threading
-import asyncio
+from collections import OrderedDict
 from functools import lru_cache
 from flask import Flask, request, Response, jsonify, stream_with_context
+from werkzeug.exceptions import HTTPException
 
-# Configure logging first (before any imports that might use it)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    force=True
+)
 logger = logging.getLogger(__name__)
 
 # Try to import tiktoken for token counting (optional but recommended)
@@ -56,6 +63,33 @@ BIND_PORT = int(os.getenv("PROXY_BIND_PORT", "8080"))
 TARGET_PROVIDER_URL = os.getenv("LLM_PROVIDER_URL", "https://api.openai.com/v1")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "4"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "25.0"))
+RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "0.5"))
+RETRY_BACKOFF_MAX = float(os.getenv("RETRY_BACKOFF_MAX", "8.0"))
+NODE_COOLDOWN_BASE = float(os.getenv("NODE_COOLDOWN_BASE", "2.0"))
+NODE_COOLDOWN_MAX = float(os.getenv("NODE_COOLDOWN_MAX", "60.0"))
+
+_HOP_BY_HOP_HEADERS = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "trailers", "transfer-encoding", "upgrade",
+    "date", "server", "content-encoding", "content-length",
+})
+
+
+def parse_retry_after(value):
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def compute_backoff(attempt, retry_after=None):
+    if retry_after is not None:
+        return min(retry_after, RETRY_BACKOFF_MAX)
+    delay = RETRY_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, RETRY_BACKOFF_BASE)
+    return min(delay, RETRY_BACKOFF_MAX)
 
 # Token optimization settings
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "120000"))  # Reserve tokens for response
@@ -68,8 +102,8 @@ REMOVE_DUPLICATE_MESSAGES = os.getenv("REMOVE_DUPLICATE_MESSAGES", "true").lower
 # Advanced compression settings (Caveman-inspired & llmlingua)
 ENABLE_SEMANTIC_COMPRESSION = os.getenv("ENABLE_SEMANTIC_COMPRESSION", "false").lower() == "true"
 SEMANTIC_COMPRESSION_RATIO = float(os.getenv("SEMANTIC_COMPRESSION_RATIO", "0.5"))  # Target 50% compression
-ENABLE_PROMPT_CACHING = os.getenv("ENABLE_PROMPT_CACHING", "false").lower() == "true"
-PROMPT_CACHE_TTL = int(os.getenv("PROMPT_CACHE_TTL", "300"))  # Cache TTL in seconds (Anthropic/OpenAI)
+_ENABLE_PROMPT_CACHING_RAW = os.getenv("ENABLE_PROMPT_CACHING")
+ENABLE_PROMPT_CACHING = (_ENABLE_PROMPT_CACHING_RAW or "false").strip().lower() == "true"
 ENABLE_IMPORTANCE_SCORING = os.getenv("ENABLE_IMPORTANCE_SCORING", "false").lower() == "true"
 MIN_MESSAGE_IMPORTANCE = float(os.getenv("MIN_MESSAGE_IMPORTANCE", "0.3"))  # Drop messages below this score
 ENABLE_RECURSIVE_SUMMARIZATION = os.getenv("ENABLE_RECURSIVE_SUMMARIZATION", "false").lower() == "true"
@@ -85,24 +119,15 @@ PROVIDER_PROFILE = os.getenv("PROVIDER_PROFILE", "openai")  # openai, anthropic,
 PROVIDER_PROFILES = {
     "openai": {
         "max_context": 128000,
-        "reserved_tokens": 4096,
-        "supports_caching": True,
-        "cache_header": "cache_control",
-        "compression_safe": True
+        "reserved_tokens": 4096
     },
     "anthropic": {
         "max_context": 200000,
-        "reserved_tokens": 8192,
-        "supports_caching": True,
-        "cache_header": "cache_control",
-        "compression_safe": True
+        "reserved_tokens": 8192
     },
     "groq": {
         "max_context": 32000,
-        "reserved_tokens": 2048,
-        "supports_caching": False,
-        "cache_header": None,
-        "compression_safe": False
+        "reserved_tokens": 2048
     }
 }
 
@@ -111,22 +136,16 @@ if PROVIDER_PROFILE in PROVIDER_PROFILES:
     _profile = PROVIDER_PROFILES[PROVIDER_PROFILE]
     MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", str(_profile["max_context"])))
     RESERVED_RESPONSE_TOKENS = int(os.getenv("RESERVED_RESPONSE_TOKENS", str(_profile["reserved_tokens"])))
-    if not ENABLE_PROMPT_CACHING:
-        ENABLE_PROMPT_CACHING = _profile["supports_caching"]
     logger.info(f"Applied provider profile: {PROVIDER_PROFILE} (max_context={MAX_CONTEXT_TOKENS})")
 else:
     logger.warning(f"Unknown provider profile '{PROVIDER_PROFILE}', using defaults")
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o")
+# Prompt-caching marker injection is Anthropic-style and breaks OpenAI-format
+# payloads, so it never defaults on: only an explicit ENABLE_PROMPT_CACHING=true
+# enables it, regardless of profile.
+ENABLE_PROMPT_CACHING = (_ENABLE_PROMPT_CACHING_RAW or "false").strip().lower() == "true"
 
-# Logging configuration
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper()),
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Build Node Pool from Environment Variables
@@ -149,7 +168,9 @@ def build_node_pool():
         pool.append({
             "proxy": proxy_url,
             "api_key": api_key,
-            "node_id": node_index
+            "node_id": node_index,
+            "consecutive_failures": 0,
+            "fail_until": 0.0
         })
         logger.info(f"Loaded node {node_index}: {proxy_url}")
         node_index += 1
@@ -174,26 +195,90 @@ session = Session()
 
 class ThreadSafeIterator:
     """
-    Thread-safe index counter for cycling the proxy pool concurrently.
-    Ensures atomic access to the current node index across multiple threads.
+    Thread-safe round-robin cursor over the node pool with per-node
+    failure cooldowns. Nodes that recently failed are skipped until their
+    cooldown expires; if every node is cooling down, the cursor node is
+    used anyway so requests never starve.
     """
-    
+
     def __init__(self, pool):
         self.pool = pool
         self.index = 0
         self.lock = threading.Lock()
+        for entry in self.pool:
+            entry.setdefault("consecutive_failures", 0)
+            entry.setdefault("fail_until", 0.0)
 
     def get_next(self):
-        """Atomically retrieve the next node and advance the cursor."""
+        """Atomically select the next usable node and advance the cursor."""
+        now = time.monotonic()
         with self.lock:
-            node = self.pool[self.index].copy()  # Return a copy to avoid mutation
-            self.index = (self.index + 1) % len(self.pool)
-            return node
-    
+            n = len(self.pool)
+            chosen = None
+            for offset in range(n):
+                i = (self.index + offset) % n
+                if self.pool[i]["fail_until"] <= now:
+                    chosen = i
+                    break
+            if chosen is None:
+                chosen = self.index % n
+            node = self.pool[chosen]
+            self.index = (chosen + 1) % n
+            return {
+                "proxy": node["proxy"],
+                "api_key": node["api_key"],
+                "node_id": node["node_id"],
+            }
+
     def get_current_index(self):
         """Get the current node index (for health checks)."""
         with self.lock:
             return self.index
+
+    def report_success(self, node):
+        with self.lock:
+            entry = self._find(node)
+            if entry is not None:
+                entry["consecutive_failures"] = 0
+                entry["fail_until"] = 0.0
+
+    def report_failure(self, node):
+        with self.lock:
+            entry = self._find(node)
+            if entry is None:
+                return
+            entry["consecutive_failures"] += 1
+            cooldown = min(
+                NODE_COOLDOWN_MAX,
+                NODE_COOLDOWN_BASE * (2 ** (entry["consecutive_failures"] - 1)),
+            )
+            entry["fail_until"] = time.monotonic() + cooldown
+
+    def clear_failures(self):
+        with self.lock:
+            for entry in self.pool:
+                entry["consecutive_failures"] = 0
+                entry["fail_until"] = 0.0
+
+    def snapshot(self):
+        """Public view of node state for health checks (never includes keys)."""
+        now = time.monotonic()
+        with self.lock:
+            return [{
+                "node_id": e["node_id"],
+                "proxy": e["proxy"],
+                "consecutive_failures": e["consecutive_failures"],
+                "cooldown_seconds": round(max(0.0, e["fail_until"] - now), 3),
+            } for e in self.pool]
+
+    def _find(self, node):
+        target = node.get("node_id") if isinstance(node, dict) else None
+        if target is None:
+            return None
+        for entry in self.pool:
+            if entry["node_id"] == target:
+                return entry
+        return None
 
 
 # Initialize the thread-safe node iterator
@@ -247,7 +332,7 @@ class TokenOptimizer:
                 self.compressor = None
         
         # LRU cache for compressed contexts (content hash -> compressed result)
-        self.context_cache = {}
+        self.context_cache = OrderedDict()
         self.cache_lock = threading.Lock()
         if ENABLE_CONTEXT_CACHE:
             logger.info(f"Context caching enabled (max size: {CONTEXT_CACHE_SIZE})")
@@ -259,21 +344,22 @@ class TokenOptimizer:
         return hashlib.md5(content_str.encode()).hexdigest()
     
     def _get_cached(self, hash_key: str) -> dict | None:
-        """Retrieve cached optimization result if available."""
+        """Retrieve cached optimization result if available, refreshing recency."""
         if not ENABLE_CONTEXT_CACHE:
             return None
         with self.cache_lock:
-            return self.context_cache.get(hash_key)
-    
+            result = self.context_cache.get(hash_key)
+            if result is not None:
+                self.context_cache.move_to_end(hash_key)
+            return result
+
     def _cache_result(self, hash_key: str, result: dict):
         """Cache optimization result with LRU eviction."""
         if not ENABLE_CONTEXT_CACHE:
             return
         with self.cache_lock:
-            # Evict oldest if at capacity
             if len(self.context_cache) >= CONTEXT_CACHE_SIZE:
-                oldest_key = next(iter(self.context_cache))
-                del self.context_cache[oldest_key]
+                self.context_cache.popitem(last=False)
             self.context_cache[hash_key] = result
     
     def count_tokens(self, text: str) -> int:
@@ -353,7 +439,6 @@ class TokenOptimizer:
         if cached_result:
             logger.info(f"Cache hit: reusing optimized context (saved {cached_result.get('tokens_saved', 0)} tokens)")
             payload["messages"] = cached_result["messages"]
-            payload["max_tokens"] = cached_result["max_tokens"]
             return payload
         
         original_token_count = self.count_message_tokens(messages)
@@ -425,15 +510,18 @@ class TokenOptimizer:
             )
         
         payload["messages"] = messages
-        payload["max_tokens"] = min(
-            payload.get("max_tokens", RESERVED_RESPONSE_TOKENS),
-            MAX_CONTEXT_TOKENS - final_token_count
+        payload["max_tokens"] = max(
+            1,
+            min(
+                payload.get("max_tokens", RESERVED_RESPONSE_TOKENS),
+                MAX_CONTEXT_TOKENS - final_token_count
+            )
         )
-        
-        # Cache the result
+
+        # Cache the result (client-specific fields like max_tokens are
+        # intentionally excluded so cache hits never override request values)
         cache_data = {
             "messages": messages,
-            "max_tokens": payload["max_tokens"],
             "tokens_saved": savings
         }
         self._cache_result(content_hash, cache_data)
@@ -471,73 +559,62 @@ class TokenOptimizer:
     def _apply_semantic_compression(self, messages: list, target_ratio: float) -> list:
         """
         Apply LLMLingua semantic compression to reduce token count while preserving meaning.
+        Uses compress_prompt() per message so per-message boundaries survive compression.
         Based on research from Microsoft's LLMLingua project.
         """
         if not self.compressor or not messages:
             return messages
-        
+
         try:
-            # Extract text content from messages
-            texts = []
+            compressed_messages = []
             for msg in messages:
                 content = msg.get("content", "")
                 if isinstance(content, str) and content.strip():
-                    texts.append(content)
-            
-            if not texts:
-                return messages
-            
-            # Compress using llmlingua
-            compressed = self.compressor.compress(
-                texts,
-                ratio=target_ratio,
-                instructions="Preserve key information, code snippets, and technical details."
-            )
-            
-            # Reconstruct messages with compressed content
-            compressed_messages = []
-            text_idx = 0
-            for msg in messages:
-                new_msg = msg.copy()
-                content = msg.get("content", "")
-                
-                if isinstance(content, str) and content.strip() and text_idx < len(compressed):
-                    new_msg["content"] = compressed[text_idx]
-                    text_idx += 1
-                
-                compressed_messages.append(new_msg)
-            
+                    result = self.compressor.compress_prompt(
+                        [content],
+                        instruction="Preserve key information, code snippets, and technical details.",
+                        ratio=target_ratio,
+                    )
+                    compressed_text = (
+                        result.get("compressed_prompt", content)
+                        if isinstance(result, dict) else str(result)
+                    )
+                    new_msg = msg.copy()
+                    new_msg["content"] = compressed_text
+                    compressed_messages.append(new_msg)
+                else:
+                    compressed_messages.append(msg)
+
             logger.info(f"Semantic compression applied with ratio {target_ratio}")
             return compressed_messages
-            
+
         except Exception as e:
             logger.error(f"Semantic compression failed: {e}. Falling back to original messages.")
             return messages
     
     def _add_prompt_caching(self, messages: list) -> list:
         """
-        Add prompt caching metadata for supported providers.
-        OpenAI: cache_control object
-        Anthropic: cache_control with ephemeral type
+        Add Anthropic-style cache_control markers for gateways that honor them.
+        OpenAI's Chat Completions API caches automatically and rejects unknown
+        content-part fields, so this stage is off unless explicitly enabled.
         """
         if not messages:
             return messages
-        
+
         # Mark system message and early context for caching
         for i, msg in enumerate(messages):
             if msg.get("role") == "system" or (i < len(messages) // 3):
                 content = msg.get("content", "")
                 if isinstance(content, str):
-                    # Convert to structured content with cache control
                     msg["content"] = [
                         {
                             "type": "text",
                             "text": content,
-                            "cache_control": {"type": "ephemeral", "ttl_seconds": PROMPT_CACHE_TTL}
+                            "cache_control": {"type": "ephemeral"}
                         }
                     ]
-        
-        logger.debug(f"Prompt caching enabled with TTL={PROMPT_CACHE_TTL}s")
+
+        logger.debug("Prompt caching markers added to system and early context")
         return messages
     
     def _filter_by_importance(self, messages: list, min_importance: float) -> list:
@@ -548,49 +625,78 @@ class TokenOptimizer:
         - Content length (longer = potentially more important)
         - Role (user queries often more important than assistant filler)
         - Keyword density (technical terms, questions, action items)
+
+        System prompts are never dropped, and dropped messages are re-inserted
+        when their removal would make two same-role messages adjacent, so
+        provider-side role-alternation validation keeps passing.
         """
         if len(messages) <= 2:
             return messages
-        
+
         scored_messages = []
         for i, msg in enumerate(messages):
             score = 0.0
             content = str(msg.get("content", ""))
             role = msg.get("role", "")
-            
+
             # Recency score (0.0 to 0.3)
             recency_score = i / max(len(messages) - 1, 1) * 0.3
             score += recency_score
-            
+
             # Content length score (0.0 to 0.2)
             length_score = min(len(content) / 1000, 1.0) * 0.2
             score += length_score
-            
+
             # Role bonus (0.0 to 0.2)
             if role == "user":
                 score += 0.2  # User queries are important
             elif role == "system":
                 score += 0.15  # System prompts are important
-            
+
             # Keyword density (0.0 to 0.3)
-            importance_keywords = ['?', '!', 'TODO', 'FIXME', 'important', 'critical', 
+            importance_keywords = ['?', '!', 'TODO', 'FIXME', 'important', 'critical',
                                    'bug', 'error', 'fix', 'implement', 'review']
             keyword_matches = sum(1 for kw in importance_keywords if kw.lower() in content.lower())
             keyword_score = min(keyword_matches / 5, 1.0) * 0.3
             score += keyword_score
-            
-            scored_messages.append((score, msg))
-        
-        # Filter out low-importance messages (except recent ones)
-        filtered = []
-        for i, (score, msg) in enumerate(scored_messages):
-            is_recent = i > len(scored_messages) - 3  # Keep last 3 messages
-            if score >= min_importance or is_recent:
-                filtered.append(msg)
+
+            scored_messages.append(score)
+
+        keep = set(range(max(0, len(messages) - 3), len(messages)))
+        for i, score in enumerate(scored_messages):
+            if score >= min_importance:
+                keep.add(i)
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                keep.add(i)
+
+        filtered = [msg for i, msg in enumerate(messages) if i in keep]
+        return self._repair_role_collisions(messages, keep, filtered)
+
+    def _repair_role_collisions(self, messages: list, keep: set, filtered: list) -> list:
+        """Re-insert dropped messages where filtering made roles collide."""
+        if len(filtered) < 2:
+            return filtered
+
+        orig_index = [i for i in range(len(messages)) if i in keep]
+        result = list(filtered)
+        inserted = set()
+        j = 1
+        while j < len(result):
+            prev_orig = orig_index[j - 1]
+            curr_orig = orig_index[j]
+            if result[j - 1].get("role") == result[j].get("role") and curr_orig - prev_orig > 1:
+                gap = [i for i in range(prev_orig + 1, curr_orig)
+                       if i not in keep and i not in inserted]
+                if gap:
+                    pick = gap[0]
+                    orig_index.insert(j, pick)
+                    result.insert(j, messages[pick])
+                    inserted.add(pick)
+                j += 1
             else:
-                logger.debug(f"Filtered low-importance {msg.get('role')} message (score: {score:.2f})")
-        
-        return filtered
+                j += 1
+        return result
     
     def _recursive_summarization(self, messages: list, max_tokens: int) -> list:
         """
@@ -766,50 +872,60 @@ def dynamic_failover_proxy(path):
     payload = request.get_data()
     method = request.method
     cookies = request.cookies
-    
+
     # Parse JSON payload for token optimization (if applicable)
     parsed_payload = None
     is_streaming = False
     if payload and request.is_json:
         try:
             parsed_payload = request.get_json(force=True)
-            
-            # Detect streaming requests
-            is_streaming = parsed_payload.get("stream", False)
-            
+
+            # Detect streaming requests from the body (OpenAI convention)
+            if isinstance(parsed_payload, dict):
+                is_streaming = bool(parsed_payload.get("stream", False))
+
             # Apply token optimization for chat completions
-            if path.endswith("chat/completions") and ENABLE_CONTEXT_COMPRESSION:
+            if isinstance(parsed_payload, dict) and path.endswith("chat/completions") and ENABLE_CONTEXT_COMPRESSION:
                 logger.info(f"Applying token optimization to request... (streaming={is_streaming})")
                 parsed_payload = token_optimizer.optimize_context(parsed_payload, is_streaming=is_streaming)
                 payload = json.dumps(parsed_payload).encode('utf-8')
-                
+
         except Exception as e:
             logger.warning(f"Could not parse/optimize payload: {e}")
-    
+
+    # Legacy clients may signal streaming via query param instead of body.
+    # Normalize the upstream body so providers actually stream back.
+    wants_stream = is_streaming or request.args.get("stream") == "true"
+    stream_upstream = wants_stream and path.endswith("chat/completions")
+    if stream_upstream and isinstance(parsed_payload, dict) and not parsed_payload.get("stream"):
+        parsed_payload["stream"] = True
+        payload = json.dumps(parsed_payload).encode('utf-8')
+
     # Filter incoming host headers to prevent proxy conflicts
     headers = {k: v for k, v in request.headers.items() if k.lower() not in ('host', 'content-length')}
-    
+
     # Construct the full target URL
     url = f"{TARGET_PROVIDER_URL}/{path}"
     last_error = None
 
     for attempt in range(MAX_RETRIES):
         node = node_iterator.get_next()
-        
+
         # Inject target node's API key
         headers["Authorization"] = f"Bearer {node['api_key']}"
-        
+
         # Configure SOCKS5H proxy (ensures DNS resolution happens on remote node)
         proxies = {
             "http": node["proxy"],
             "https": node["proxy"]
         }
-        
+
         logger.info(
             f"Attempt {attempt + 1}/{MAX_RETRIES}: Routing via Node {node['node_id']} "
             f"({node['proxy'].split('://')[1].split(':')[0]})"
         )
 
+        retry_after = None
         try:
             response = session.request(
                 method=method,
@@ -819,7 +935,7 @@ def dynamic_failover_proxy(path):
                 cookies=cookies,
                 proxies=proxies,
                 timeout=REQUEST_TIMEOUT,
-                stream=True if path.endswith("chat/completions") else False
+                stream=stream_upstream
             )
 
             # Trigger failover on rate limits or server errors
@@ -829,10 +945,16 @@ def dynamic_failover_proxy(path):
                     f"Retrying with next node..."
                 )
                 last_error = f"Upstream error: {response.status_code}"
+                retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                response.close()
+                node_iterator.report_failure(node)
                 continue
-            
-            # Log token usage if available
-            if response.status_code == 200 and parsed_payload:
+
+            node_iterator.report_success(node)
+
+            # Log token usage only for buffered JSON bodies; calling .json()
+            # on a streamed SSE response would consume the whole stream.
+            if response.status_code == 200 and parsed_payload and not stream_upstream:
                 try:
                     resp_json = response.json()
                     usage = resp_json.get("usage", {})
@@ -844,30 +966,44 @@ def dynamic_failover_proxy(path):
                         )
                 except Exception:
                     pass
-            
-            # Successful response - stream or return normally
-            if path.endswith("chat/completions") and request.args.get("stream") == "true":
+
+            # Strip hop-by-hop and framing headers; requests has already
+            # decoded content-encoding and werkzeug owns connection framing.
+            forward_headers = [
+                (k, v) for k, v in response.headers.items()
+                if k.lower() not in _HOP_BY_HOP_HEADERS
+            ]
+
+            if stream_upstream:
                 def generate():
-                    for chunk in response.iter_content(chunk_size=8192):
-                        yield chunk
-                return Response(generate(), response.status_code, response.headers.items())
-            else:
-                return Response(response.content, response.status_code, response.headers.items())
+                    try:
+                        # chunk_size=1: larger sizes do exact blocking reads and
+                        # buffer small SSE events until EOF, killing latency.
+                        for chunk in response.iter_content(chunk_size=1):
+                            yield chunk
+                    finally:
+                        response.close()
+                return Response(generate(), response.status_code, forward_headers)
+
+            body = response.content
+            response.close()
+            return Response(body, response.status_code, forward_headers)
 
         except Timeout as e:
             logger.error(f"Timeout on Node {node['node_id']}: {str(e)}. Retrying...")
             last_error = f"Timeout: {str(e)}"
-            continue
-            
+            node_iterator.report_failure(node)
         except ConnectionError as e:
             logger.error(f"Connection error on Node {node['node_id']}: {str(e)}. Retrying...")
             last_error = f"Connection error: {str(e)}"
-            continue
-            
+            node_iterator.report_failure(node)
         except RequestException as e:
             logger.error(f"Request failed on Node {node['node_id']}: {str(e)}. Retrying...")
             last_error = f"Request error: {str(e)}"
-            continue
+            node_iterator.report_failure(node)
+
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(compute_backoff(attempt, retry_after))
 
     # All retries exhausted
     logger.critical(f"All {MAX_RETRIES} proxy nodes failed. Last error: {last_error}")
@@ -891,6 +1027,7 @@ def health_check():
         "status": "healthy",
         "nodes_configured": len(NODE_POOL),
         "current_node_index": node_iterator.get_current_index(),
+        "nodes": node_iterator.snapshot(),
         "token_optimization_enabled": ENABLE_CONTEXT_COMPRESSION,
         "max_context_tokens": MAX_CONTEXT_TOKENS,
         "reserved_response_tokens": RESERVED_RESPONSE_TOKENS
@@ -919,7 +1056,9 @@ def list_models():
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    """Global exception handler."""
+    """Global exception handler; HTTP errors keep their own status codes."""
+    if isinstance(e, HTTPException):
+        return e
     logger.exception(f"Unhandled exception: {e}")
     return jsonify({
         "error": {
