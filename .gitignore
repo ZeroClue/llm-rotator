@@ -1,1 +1,23 @@
-Nothing needs to be added to .gitignore since only a markdown file (PR_DESCRIPTION.md) was added, which is a source/config file and not a build artifact, dependency, or temporary file.
+# --- Secrets & local config ---
+.env
+.env.*
+!.env.example
+
+# --- Python artifacts ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Test / tooling caches ---
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Session-local analysis (not for publication) ---
+FINDINGS.md
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
