@@ -18,6 +18,10 @@ import logging
 import threading
 from flask import Flask, request, Response, jsonify
 
+# Configure logging first (before any imports that might use it)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
 # Try to import tiktoken for token counting (optional but recommended)
 try:
     import tiktoken
