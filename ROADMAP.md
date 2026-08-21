@@ -30,7 +30,7 @@ reckless. ~15 lines + tests.
 *Acceptance:* with token set, mismatched requests get 401 and never reach upstream
 (mock capture proves it); unset behaves exactly as today.
 
-### 3. Node-aware readiness — `todo`
+### 3. Node-aware readiness — `done` (2026-08-21)
 Add `nodes_available` (count of nodes not in cooldown) to `/health`; optionally a
 separate `/ready` returning 503 when zero nodes are usable.
 *Rationale:* `/health` reports `healthy` even with every node dead — orchestrators

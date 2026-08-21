@@ -331,6 +331,33 @@ def test_models_endpoint_requires_token_too(rotator, monkeypatch, client):
     assert client.get("/v1/models").status_code == 401
 
 
+def test_health_reports_available_node_count(client):
+    resp = client.get("/health")
+    body = resp.get_json()
+    assert body["nodes_available"] == body["nodes_configured"]
+
+
+def test_ready_flips_503_when_all_nodes_cooling(rotator, monkeypatch, client):
+    monkeypatch.setattr(rotator, "NODE_COOLDOWN_BASE", 30)
+    monkeypatch.setattr(rotator, "NODE_COOLDOWN_MAX", 300)
+    assert client.get("/ready").status_code == 200
+    for node in rotator.NODE_POOL:
+        rotator.node_iterator.report_failure(
+            {"node_id": node["node_id"], "proxy": node["proxy"], "api_key": node["api_key"]}
+        )
+    resp = client.get("/ready")
+    assert resp.status_code == 503
+    assert resp.get_json()["nodes_available"] == 0
+    health = client.get("/health").get_json()
+    assert health["nodes_available"] == 0
+    assert health["status"] == "healthy"  # /health shape unchanged otherwise
+
+
+def test_ready_stays_open_with_auth_enabled(rotator, monkeypatch, client):
+    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    assert client.get("/ready").status_code == 200
+
+
 def test_unknown_path_returns_404(client):
     resp = client.get("/definitely/not/here")
     assert resp.status_code == 404
