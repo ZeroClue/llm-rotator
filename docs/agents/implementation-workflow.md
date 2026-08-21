@@ -18,28 +18,28 @@ this workflow overrides it.
 3. **PR** — Open with `gh pr create`. Every `Closes #N` must name the issue
    whose acceptance criteria this diff actually implements (read the issue
    body; roadmap numbering and issue numbers diverge). Apply `ready-for-agent`
-   if the PR is agent-grabbable.
+   if the PR is agent-grabbable (vocabulary: `docs/agents/triage-labels.md`).
 4. **Code review** — Run `/code-review` against `main` (the merge-base). Fix
    findings on the same branch; commit AND push the fixes before merging.
    Review without landed fixes is a no-op.
 5. **Verify remote matches the intended diff** —
-   `gh api repos/{owner}/{repo}/pulls/<N>/files` must list every file in the
-   full change set (check after every push). Merging an under-pushed PR lands
-   only what GitHub has; the rest is lost until someone notices.
+   `gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/pulls/<N>/files`
+   must list every file in the full change set (check after every push).
+   Merging an under-pushed PR lands only what GitHub has; the rest is lost
+   until someone notices.
 6. **Live verification** — For user-facing behavior, deploy locally
    (`docker build` + `docker-compose up`) and exercise the feature
    (playwright-cli for UI, curl for APIs) before merging. Unit tests green is
-   necessary, not sufficient. Internal refactors with no behavior change may
-   skip this gate; say why in the PR body.
+   necessary, not sufficient. Whether a change is user-facing follows from the
+   issue's acceptance criteria, not the diff's size.
 7. **Merge** — Once gates 4–6 pass:
    `gh pr merge --squash --delete-branch`.
 8. **Close tickets** — Issues linked with `Closes #N` auto-close on merge;
-   close stragglers with
-   `gh issue close <N> --comment "Done in #<PR>"`. An issue counts as done
-   only when its acceptance criteria are verified in code on `main`
-   (read/grep/build/test), never because a PR or commit message mentioned it.
-   Partial work: keep the issue open, note progress in a comment, split
-   remaining criteria into focused issues.
+   close stragglers per `docs/agents/issue-tracker.md`. An issue counts as
+   done only when its acceptance criteria are verified in code on `main`
+   (read/grep/build/test). Partial work: keep the issue open, note progress in
+   a comment, split remaining criteria into focused issues.
 9. **Update CONTEXT.md** — If domain terms or decisions changed during
    implementation, update `CONTEXT.md` and add an ADR if the decision is hard
-   to reverse.
+   to reverse. Gate: every domain term in the merged diff matches the
+   `CONTEXT.md` glossary; every hard-to-reverse decision has an ADR.
