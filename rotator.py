@@ -194,8 +194,8 @@ app = Flask(__name__)
 session = Session()
 
 # Optional bearer-token gate. Empty disables auth entirely (current behavior
-# for existing deployments). /health stays open either way so orchestrators
-# can probe the process without holding the token.
+# for existing deployments). /health and /ready stay open either way so
+# orchestrators can probe the process without holding the token.
 PROXY_AUTH_TOKEN = os.getenv("PROXY_AUTH_TOKEN", "")
 
 
@@ -1061,12 +1061,13 @@ def nodes_available_count():
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for monitoring."""
+    nodes = node_iterator.snapshot()
     return jsonify({
         "status": "healthy",
         "nodes_configured": len(NODE_POOL),
-        "nodes_available": nodes_available_count(),
+        "nodes_available": sum(1 for e in nodes if e["cooldown_seconds"] <= 0),
         "current_node_index": node_iterator.get_current_index(),
-        "nodes": node_iterator.snapshot(),
+        "nodes": nodes,
         "token_optimization_enabled": ENABLE_CONTEXT_COMPRESSION,
         "max_context_tokens": MAX_CONTEXT_TOKENS,
         "reserved_response_tokens": RESERVED_RESPONSE_TOKENS
