@@ -44,19 +44,25 @@ def client(rotator):
     return rotator.app.test_client()
 
 
+def build_optimizer(rotator, **overrides):
+    """Fresh TokenOptimizer from OPTIMIZATION_CONFIG with field overrides —
+    the single builder both the fixture and pipeline tests share."""
+    import dataclasses
+
+    cfg = (
+        dataclasses.replace(rotator.OPTIMIZATION_CONFIG, **overrides)
+        if overrides
+        else rotator.OPTIMIZATION_CONFIG
+    )
+    return rotator.TokenOptimizer(config=cfg, model_name=rotator.DEFAULT_MODEL)
+
+
 @pytest.fixture()
 def make_optimizer(rotator, monkeypatch):
     """Build a fresh TokenOptimizer with explicit OptimizationConfig overrides
     and swap it in as the module-level optimizer the view resolves."""
-    import dataclasses
-
     def _make(**overrides):
-        cfg = (
-            dataclasses.replace(rotator.OPTIMIZATION_CONFIG, **overrides)
-            if overrides
-            else rotator.OPTIMIZATION_CONFIG
-        )
-        opt = rotator.TokenOptimizer(config=cfg, model_name=rotator.DEFAULT_MODEL)
+        opt = build_optimizer(rotator, **overrides)
         monkeypatch.setattr(rotator, "token_optimizer", opt)
         return opt
 

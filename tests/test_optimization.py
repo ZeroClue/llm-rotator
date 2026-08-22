@@ -6,16 +6,15 @@ monkeypatching. Stage behavior, purity, routing, gating, degradation,
 and cache eviction are all observed through the contract.
 """
 
-import dataclasses
+import copy
 
 import pytest
 
+from conftest import build_optimizer
+
 
 def build(rotator, **overrides):
-    base = rotator.OPTIMIZATION_CONFIG
-    if overrides:
-        base = dataclasses.replace(base, **overrides)
-    return rotator.TokenOptimizer(config=base, model_name=rotator.DEFAULT_MODEL)
+    return build_optimizer(rotator, **overrides)
 
 
 def chat_payload(messages, **extra):
@@ -60,8 +59,6 @@ def test_purity_input_is_never_mutated(rotator):
         {"role": "user", "content": "q"},  # duplicate the stage will drop
     ]
     payload = chat_payload(msgs, max_tokens=12345)
-    snapshot = dataclasses.replace  # noqa: F841 (keep dataclasses imported symmetrically)
-    import copy
     before = copy.deepcopy(payload)
 
     result = opt.optimize_context(payload, path="v1/chat/completions")

@@ -23,7 +23,7 @@ import time
 import logging
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
 from flask import Flask, request, Response, jsonify, stream_with_context
@@ -301,8 +301,13 @@ _PROVIDER_PROFILES = {
 }
 
 
-def _env_flag(name, default):
-    return os.getenv(name, default).strip().lower() == "true"
+def _env_bool(raw):
+    return raw.lower() == "true"
+
+
+def _env_prompt_cache_bool(raw):
+    # Prompt-caching parsing historically stripped whitespace; keep exact.
+    return raw.strip().lower() == "true"
 
 
 @dataclass(frozen=True)
@@ -332,31 +337,49 @@ class OptimizationConfig:
 
     @classmethod
     def from_env(cls) -> "OptimizationConfig":
+        """Overlay environment settings onto the dataclass defaults; provider
+        profiles only supply the context-budget fallbacks."""
         profile_name = os.getenv("PROVIDER_PROFILE", "openai")
         profile = _PROVIDER_PROFILES.get(profile_name)
         if profile is None:
             logger.warning(f"Unknown provider profile '{profile_name}', using defaults")
-            profile = {"max_context": 120000, "reserved_tokens": 4000}
+            base = cls()
         else:
             logger.info(f"Applied provider profile: {profile_name} (max_context={profile['max_context']})")
-        return cls(
-            enabled=_env_flag("ENABLE_CONTEXT_COMPRESSION", "true"),
-            streaming_fastpath=_env_flag("ENABLE_STREAMING_FASTPATH", "true"),
-            remove_duplicates=_env_flag("REMOVE_DUPLICATE_MESSAGES", "true"),
-            strip_whitespace=_env_flag("STRIP_WHITESPACE", "true"),
-            max_context_tokens=int(os.getenv("MAX_CONTEXT_TOKENS", str(profile["max_context"]))),
-            reserved_response_tokens=int(os.getenv("RESERVED_RESPONSE_TOKENS", str(profile["reserved_tokens"]))),
-            enable_semantic_compression=_env_flag("ENABLE_SEMANTIC_COMPRESSION", "false"),
-            semantic_compression_ratio=float(os.getenv("SEMANTIC_COMPRESSION_RATIO", "0.5")),
-            enable_prompt_caching=_env_flag("ENABLE_PROMPT_CACHING", "false"),
-            enable_importance_scoring=_env_flag("ENABLE_IMPORTANCE_SCORING", "false"),
-            min_message_importance=float(os.getenv("MIN_MESSAGE_IMPORTANCE", "0.3")),
-            enable_recursive_summarization=_env_flag("ENABLE_RECURSIVE_SUMMARIZATION", "false"),
-            compression_threshold=float(os.getenv("COMPRESSION_THRESHOLD", "0.85")),
-            summarization_model=os.getenv("SUMMARIZATION_MODEL", "gpt-4o-mini"),
-            enable_context_cache=_env_flag("ENABLE_CONTEXT_CACHE", "true"),
-            context_cache_size=int(os.getenv("CONTEXT_CACHE_SIZE", "128")),
-        )
+            base = cls(
+                max_context_tokens=profile["max_context"],
+                reserved_response_tokens=profile["reserved_tokens"],
+            )
+
+        overrides = {}
+        for field_name, env_name, cast in [
+            ("enabled", "ENABLE_CONTEXT_COMPRESSION", _env_bool),
+            ("streaming_fastpath", "ENABLE_STREAMING_FASTPATH", _env_bool),
+            ("remove_duplicates", "REMOVE_DUPLICATE_MESSAGES", _env_bool),
+            ("strip_whitespace", "STRIP_WHITESPACE", _env_bool),
+            ("enable_semantic_compression", "ENABLE_SEMANTIC_COMPRESSION", _env_bool),
+            ("semantic_compression_ratio", "SEMANTIC_COMPRESSION_RATIO", float),
+            ("enable_prompt_caching", "ENABLE_PROMPT_CACHING", _env_prompt_cache_bool),
+            ("enable_importance_scoring", "ENABLE_IMPORTANCE_SCORING", _env_bool),
+            ("min_message_importance", "MIN_MESSAGE_IMPORTANCE", float),
+            ("enable_recursive_summarization", "ENABLE_RECURSIVE_SUMMARIZATION", _env_bool),
+            ("compression_threshold", "COMPRESSION_THRESHOLD", float),
+            ("summarization_model", "SUMMARIZATION_MODEL", str),
+            ("enable_context_cache", "ENABLE_CONTEXT_CACHE", _env_bool),
+            ("context_cache_size", "CONTEXT_CACHE_SIZE", int),
+        ]:
+            raw = os.getenv(env_name)
+            if raw is not None:
+                overrides[field_name] = cast(raw)
+        for field_name, env_name, cast in [
+            ("max_context_tokens", "MAX_CONTEXT_TOKENS", int),
+            ("reserved_response_tokens", "RESERVED_RESPONSE_TOKENS", int),
+        ]:
+            raw = os.getenv(env_name)
+            if raw is not None:
+                overrides[field_name] = cast(raw)
+
+        return replace(base, **overrides)
 
 
 class TokenOptimizer:
@@ -492,10 +515,12 @@ class TokenOptimizer:
         a chat/completions endpoint and the gate in OptimizationConfig is
         on; anything else comes back untouched (same object).
 
-        Purity: the input payload and its messages are never mutated; the
-        returned payload is a new dict. On any internal failure the input
-        is returned unoptimized — optimization must never break the
-        proxied request.
+        Purity: the input payload and its message dicts are never mutated —
+        each message is shallow-copied at entry, so top-level keys are
+        private to the pipeline; deeply nested values (e.g. list-typed
+        content parts) are shared until a stage rewrites them. On any
+        internal failure the input is returned unoptimized — optimization
+        must never break the proxied request.
 
         The returned payload's max_tokens may be clamped down to fit the
         remaining context budget (client value wins whenever it fits);
@@ -505,11 +530,12 @@ class TokenOptimizer:
         if not cfg.enabled or not path.endswith("chat/completions"):
             return payload
 
-        messages = payload.get("messages")
+        messages = payload.get("messages") if isinstance(payload, dict) else None
         if not isinstance(messages, list) or not messages:
             return payload
 
         try:
+            logger.info(f"Applying token optimization to request... (streaming={is_streaming})")
             return self._optimize(dict(payload), [dict(m) for m in messages], is_streaming)
         except Exception:
             logger.exception("Context optimization failed; forwarding payload unoptimized")
