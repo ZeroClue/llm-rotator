@@ -6,6 +6,8 @@ import sys
 
 import pytest
 
+import failover
+
 
 def jload(text):
     return json.loads(text)
@@ -177,29 +179,24 @@ def test_retry_after_header_is_honored(mock, client):
     assert len(mock.chat_posts()) >= 2
 
 
-def test_compute_backoff_bounds(rotator, monkeypatch):
-    monkeypatch.setattr(rotator, "RETRY_BACKOFF_BASE", 0.5)
-    monkeypatch.setattr(rotator, "RETRY_BACKOFF_MAX", 8.0)
-    ra = rotator.compute_backoff(0, 2.0)
+def test_compute_backoff_bounds():
+    ra = failover.compute_backoff(0, 2.0)
     assert ra == 2.0
-    assert rotator.compute_backoff(0, 100.0) == 8.0
+    assert failover.compute_backoff(0, 100.0) == 8.0
     for attempt in range(6):
-        d = rotator.compute_backoff(attempt, None)
+        d = failover.compute_backoff(attempt, None)
         assert 0.5 <= d <= 8.0
-    assert rotator.compute_backoff(3, None) >= rotator.compute_backoff(0, None)
+    assert failover.compute_backoff(3, None) >= failover.compute_backoff(0, None)
 
 
-def test_compute_backoff_jitter_is_injectable(rotator, monkeypatch):
-    monkeypatch.setattr(rotator, "RETRY_BACKOFF_BASE", 0.5)
-    monkeypatch.setattr(rotator, "RETRY_BACKOFF_MAX", 8.0)
-
+def test_compute_backoff_jitter_is_injectable():
     def stub(lo, hi):
         return hi / 4  # deterministic quarter of the jitter band
 
-    assert rotator.compute_backoff(0, None, rng=stub) == 0.625  # 0.5·2⁰ + 0.125
-    assert rotator.compute_backoff(1, None, rng=stub) == 1.125  # 0.5·2¹ + 0.125
-    assert rotator.compute_backoff(5, None, rng=stub) == 8.0  # capped
-    assert rotator.compute_backoff(0, 2.0, rng=stub) == 2.0  # Retry-After ignores jitter
+    assert failover.compute_backoff(0, None, rng=stub) == 0.625  # 0.5·2⁰ + 0.125
+    assert failover.compute_backoff(1, None, rng=stub) == 1.125  # 0.5·2¹ + 0.125
+    assert failover.compute_backoff(5, None, rng=stub) == 8.0  # capped
+    assert failover.compute_backoff(0, 2.0, rng=stub) == 2.0  # Retry-After ignores jitter
 
 
 def make_nodes(rotator, count=2):

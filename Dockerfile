@@ -15,7 +15,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY rotator.py gunicorn.conf.py ./
+COPY rotator.py failover.py gunicorn.conf.py ./
 
 # Pre-cache the tiktoken BPE file for the default model so first startup
 # never stalls on a tokenizer download (matters on egress-restricted hosts).

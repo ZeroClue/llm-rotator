@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Single-file Flask proxy (`rotator.py`) that rotates OpenAI-compatible LLM requests across Tailscale SOCKS5 egress nodes: thread-safe round-robin, per-node API-key injection, failover on 429/5xx/timeouts with backoff and per-node cooldowns, plus an optional token-compression pipeline applied to `/v1/chat/completions` payloads. All configuration is environment variables; `.env.example` matches the actual code.
+Flask proxy that rotates OpenAI-compatible LLM requests across Tailscale SOCKS5 egress nodes: thread-safe round-robin, per-node API-key injection, failover on 429/5xx/timeouts with backoff and per-node cooldowns, plus an optional token-compression pipeline applied to `/v1/chat/completions` payloads. `rotator.py` holds the app, node pool (`Node`/`HealthLedger`/`NodeSelector`), and views; `failover.py` holds the framework-free retry/failover transport (`FailoverTransport.send()` → `SendResult | AllNodesFailed`). All configuration is environment variables; `.env.example` matches the actual code.
 
 ## Planning
 
@@ -14,7 +14,7 @@ pip install -r requirements.txt    # flask, gunicorn, requests, tiktoken
 pip install pytest                 # test-only
 
 # Only static check available:
-python3 -m py_compile rotator.py
+python3 -m py_compile rotator.py failover.py
 
 # Test suite — fully offline (mock upstream, no Tailscale needed):
 python3 -m pytest tests/ -v
@@ -31,9 +31,9 @@ Production runs use gunicorn (`gunicorn.conf.py`, gthread workers): `gunicorn -c
 - **README.md and PR_DESCRIPTION.md are aspirational and diverge from the code — trust `rotator.py`.** README documents env vars that don't exist (`ENABLE_STRUCTURAL_HYGIENE`, `ENABLE_SMART_TRUNCATION`, `MIN_MESSAGE_LENGTH`, `LLMLINGUA_*`, `IMPORTANCE_KEYWORDS`, `SYSTEM_PROMPT_WEIGHT`, `RECENT_MESSAGES_WEIGHT`, `ENABLE_SUMMARIZATION`, `MAX_SUMMARY_TOKENS`, `STREAMING_CHUNK_SIZE`, `PROMPT_CACHE_TTL`) and a `/health/detailed` endpoint. Actual endpoints: `/v1/<path>`, `/v1/models`, `/health` (which includes a per-node `nodes` array).
 - **Bind vars are `PROXY_BIND_HOST`/`PROXY_BIND_PORT`**, not the README's `BIND_HOST`/`BIND_PORT`.
 - **Requires Python >= 3.10** despite README saying 3.8+: `dict | None` annotations are evaluated eagerly.
-- **Importing `rotator` has side effects**: the node pool builds at module level and raises `SystemExit(1)` unless `PROXY_1_URL` + `API_KEY_1` are set. Tests handle this in `tests/conftest.py`; don't import bare.
+- **Importing `rotator` has side effects**: the node pool builds at module level and raises `SystemExit(1)` unless `PROXY_1_URL` + `API_KEY_1` are set. Tests handle this in `tests/conftest.py`; don't import bare. (`failover.py` is safe to import bare — it builds nothing.)
 - **Node env vars must be contiguous from 1** (`PROXY_1_URL`, `PROXY_2_URL`, ...): the loader stops at the first missing index, silently dropping later nodes.
-- **Streaming passthrough uses `iter_content(chunk_size=1)` on purpose**: requests does exact blocking reads, so any larger chunk size buffers small SSE events until EOF and destroys latency. Don't "optimize" it back to 8192.
+- **Streaming passthrough uses `iter_content(chunk_size=1)` on purpose** (in `failover.py`'s streaming generator): requests does exact blocking reads, so any larger chunk size buffers small SSE events until EOF and destroys latency. Don't "optimize" it back to 8192.
 - **Prompt-caching markers are Anthropic-style** (`cache_control: {type: ephemeral}`) and OpenAI rejects them, so stage 3 is off unless `ENABLE_PROMPT_CACHING=true` is set explicitly — provider profiles never enable it.
 - **`.gitignore` now has real patterns** (`.env`, `__pycache__/`, `FINDINGS.md`, caches) — but `__pycache__/` was committed earlier and stays tracked until `git rm -r --cached __pycache__` is run; ignore rules don't untrack files.
 - First startup with tiktoken downloads the tokenizer file for the default model unless cached — the Docker image pre-bakes it via `TIKTOKEN_CACHE_DIR`; bare-metal first runs need network or a warm cache.
@@ -42,8 +42,9 @@ Production runs use gunicorn (`gunicorn.conf.py`, gthread workers): `gunicorn -c
 ## Testing
 
 - `tests/test_rotator.py` runs against Flask's test client with two env-configured nodes: node 1 is a dead port (exercises failover), node 2 is `MockUpstream` (`tests/mock_upstream.py`), a scriptable OpenAI-compatible upstream that captures every request.
+- `tests/test_failover.py` drives `FailoverTransport` directly with a scripted fake session, recording sleeper, and stubbed rng — retry/failover logic is tested without HTTP or real sleeps.
 - `tests/test_streaming_live.py` spawns `rotator.py` as a subprocess and asserts chunks arrive incrementally (TTFB well before completion); it scrubs inherited `PROXY_*`/`API_KEY_*`/`LLM_PROVIDER_URL` env vars first.
-- Flag-specific tests flip module globals via `monkeypatch.setattr(rotator, ...)` instead of re-importing; clear `token_optimizer.context_cache` between tests if you add cache-sensitive cases.
+- Flag-specific tests flip module globals via `monkeypatch.setattr(rotator, ...)` instead of re-importing; transport/cooldown knobs are constructor-injected instead — build fakes explicitly. Clear `token_optimizer.context_cache` between tests if you add cache-sensitive cases.
 
 ## Deployment
 
