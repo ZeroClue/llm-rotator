@@ -11,7 +11,6 @@ Features:
 - DNS leak prevention via socks5h:// protocol
 - Streaming support with fast-path bypass for real-time responses
 - Post-optimization token verification to prevent double-counting
-- LRU caching for repeated context blocks
 - Provider-specific optimization profiles
 """
 
@@ -22,9 +21,7 @@ import json
 import time
 import logging
 import threading
-from collections import OrderedDict
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
 
 from flask import Flask, request, Response, jsonify, stream_with_context
 from werkzeug.exceptions import HTTPException
@@ -332,8 +329,6 @@ class OptimizationConfig:
     enable_recursive_summarization: bool = False
     compression_threshold: float = 0.85
     summarization_model: str = "gpt-4o-mini"
-    enable_context_cache: bool = True
-    context_cache_size: int = 128
 
     @classmethod
     def from_env(cls) -> "OptimizationConfig":
@@ -365,8 +360,6 @@ class OptimizationConfig:
             ("enable_recursive_summarization", "ENABLE_RECURSIVE_SUMMARIZATION", _env_bool),
             ("compression_threshold", "COMPRESSION_THRESHOLD", float),
             ("summarization_model", "SUMMARIZATION_MODEL", str),
-            ("enable_context_cache", "ENABLE_CONTEXT_CACHE", _env_bool),
-            ("context_cache_size", "CONTEXT_CACHE_SIZE", int),
         ]:
             raw = os.getenv(env_name)
             if raw is not None:
@@ -403,7 +396,6 @@ class TokenOptimizer:
 
     Improvements:
     - Post-optimization verification to prevent double-counting
-    - LRU caching for repeated context blocks
     - Streaming fast-path bypass for real-time responses
     - Provider-specific token calculations
     """
@@ -433,37 +425,6 @@ class TokenOptimizer:
                 logger.warning(f"Failed to initialize llmlingua: {e}")
                 self.compressor = None
 
-        # LRU cache for compressed contexts (content hash -> compressed result)
-        self.context_cache = OrderedDict()
-        self.cache_lock = threading.Lock()
-        if self.config.enable_context_cache:
-            logger.info(f"Context caching enabled (max size: {self.config.context_cache_size})")
-    
-    def _hash_content(self, messages: list) -> str:
-        """Generate a hash key for message content caching."""
-        import hashlib
-        content_str = json.dumps(messages, sort_keys=True)
-        return hashlib.md5(content_str.encode()).hexdigest()
-    
-    def _get_cached(self, hash_key: str) -> dict | None:
-        """Retrieve cached optimization result if available, refreshing recency."""
-        if not self.config.enable_context_cache:
-            return None
-        with self.cache_lock:
-            result = self.context_cache.get(hash_key)
-            if result is not None:
-                self.context_cache.move_to_end(hash_key)
-            return result
-
-    def _cache_result(self, hash_key: str, result: dict):
-        """Cache optimization result with LRU eviction."""
-        if not self.config.enable_context_cache:
-            return
-        with self.cache_lock:
-            if len(self.context_cache) >= self.config.context_cache_size:
-                self.context_cache.popitem(last=False)
-            self.context_cache[hash_key] = result
-    
     def count_tokens(self, text: str) -> int:
         """Count tokens in a text string."""
         if not self.encoding:
@@ -553,13 +514,6 @@ class TokenOptimizer:
                 messages = self._strip_whitespace(messages)
             return {**payload, "messages": messages}
 
-        # Check cache for identical context
-        content_hash = self._hash_content(messages)
-        cached_result = self._get_cached(content_hash)
-        if cached_result:
-            logger.info(f"Cache hit: reusing optimized context (saved {cached_result.get('tokens_saved', 0)} tokens)")
-            return {**payload, "messages": [dict(m) for m in cached_result["messages"]]}
-
         original_token_count = self.count_message_tokens(messages)
         logger.debug(f"Original message token count: {original_token_count}")
 
@@ -638,14 +592,6 @@ class TokenOptimizer:
             "messages": messages,
             "max_tokens": clamped_max,
         }
-
-        # Cache the result (client-specific fields like max_tokens are
-        # intentionally excluded so cache hits never override request values)
-        cache_data = {
-            "messages": messages,
-            "tokens_saved": savings
-        }
-        self._cache_result(content_hash, cache_data)
 
         return result
     
