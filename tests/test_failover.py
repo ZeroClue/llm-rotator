@@ -72,7 +72,7 @@ def stub_rng(lo, hi):
 
 
 def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
-                   backoff_base=0.5, backoff_max=8.0):
+                   backoff_base=0.5, backoff_max=8.0, use_real_session=False):
     nodes = [
         rotator.Node(node_id=i, proxy=f"socks5h://node{i}.ts.net:1080", api_key=f"key{i}")
         for i in range(1, count + 1)
@@ -80,7 +80,7 @@ def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
     ledger = rotator.HealthLedger(nodes, 30.0, 300.0)
     selector = rotator.NodeSelector(nodes, ledger)
     sleeper = RecordingSleeper()
-    session = FakeSession(script)
+    session = None if use_real_session else FakeSession(script)
     transport = failover.FailoverTransport(
         selector, ledger,
         session=session,
@@ -91,7 +91,7 @@ def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
         backoff_base=backoff_base,
         backoff_max=backoff_max,
     )
-    return transport, ledger, sleeper, nodes, session
+    return transport, ledger, sleeper, nodes, session or transport.session
 
 
 def test_429_records_cooldown_and_retries_on_next_node(rotator):
@@ -214,14 +214,34 @@ def test_buffered_body_returns_bytes_and_closes_underlying(rotator):
     assert rok.closed
 
 
-def test_cookies_are_forwarded_to_the_upstream_call(rotator):
+def test_client_cookies_never_reach_the_upstream(rotator):
+    """Neither the cookies= channel (removed) nor a client Cookie header may
+    reach the upstream call."""
     rok = FakeResponse(status=200, content=b"ok")
     t, *_ , session = make_transport(rotator, [rok])
-    cookies = {"session_id": "abc"}
 
-    t.send("POST", "http://up.test/v1", headers={}, payload=b"{}", cookies=cookies)
+    t.send("POST", "http://up.test/v1",
+           headers={"Cookie": "session_id=abc; other=x"}, payload=b"{}")
 
-    assert session.calls[0]["cookies"] == cookies
+    call = session.calls[0]
+    assert call["headers"].get("Cookie") is None
+    assert "cookie" not in {k.lower() for k in call["headers"]}
+
+
+def test_production_session_never_stores_upstream_cookies(rotator):
+    import http.cookiejar
+
+    cookie = http.cookiejar.Cookie(
+        0, "tracker", "leak", None, False, "up.test", True, False,
+        "/", True, False, None, False, None, None, {},
+    )
+    # The policy itself refuses every cookie...
+    assert failover._NoStoreCookiePolicy().set_ok(cookie, None) is False
+
+    # ...and the production-built session is wired with it (fake sessions are
+    # injected untouched).
+    t, *_ , session = make_transport(rotator, [], use_real_session=True)
+    assert isinstance(session.cookies._policy, failover._NoStoreCookiePolicy)
 
 
 def test_compute_backoff_bounds(rotator):

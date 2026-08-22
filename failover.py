@@ -9,6 +9,7 @@ ownership stay in the rotator's NodeSelector/HealthLedger — this module
 only drives attempts and classifies outcomes.
 """
 
+import http.cookiejar
 import logging
 import random
 import time
@@ -26,9 +27,22 @@ _HOP_BY_HOP_HEADERS = frozenset({
 })
 
 # Client headers that must never be forwarded upstream; Authorization is
-# injected per attempt and anything host/framing-related is the transport's
-# business, not the client's.
-_OUTBOUND_DROPPED_HEADERS = frozenset({"host", "content-length"})
+# injected per attempt and anything host/framing/cookie-related is the
+# transport's business, not the client's. Cookies especially: they would ride
+# whatever egress node the request rotates through.
+_OUTBOUND_DROPPED_HEADERS = frozenset({"host", "content-length", "cookie"})
+
+
+class _NoStoreCookiePolicy(http.cookiejar.DefaultCookiePolicy):
+    """Refuses every Set-Cookie: the session jar is shared across worker
+    threads (unsynchronized mutation = race) and stored cookies would leak
+    between egress nodes."""
+
+    def set_ok(self, cookie, request):
+        return False
+
+    def return_ok(self, cookie, request):
+        return False
 
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
@@ -102,7 +116,12 @@ class FailoverTransport:
                  backoff_base=0.5, backoff_max=8.0):
         self.selector = selector
         self.ledger = ledger
-        self.session = session if session is not None else requests.Session()
+        if session is not None:
+            self.session = session
+        else:
+            self.session = requests.Session()
+            # Never store upstream cookies (see _NoStoreCookiePolicy).
+            self.session.cookies.set_policy(_NoStoreCookiePolicy())
         self.sleep = sleep
         self.rng = rng
         self.max_retries = max_retries
@@ -110,8 +129,7 @@ class FailoverTransport:
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
 
-    def send(self, method, url, headers, payload=b"", cookies=None,
-             stream=False):
+    def send(self, method, url, headers, payload=b"", stream=False):
         last_error = None
         for attempt in range(self.max_retries):
             node = self.selector.select()
@@ -135,7 +153,6 @@ class FailoverTransport:
                     url=url,
                     headers=request_headers,
                     data=payload,
-                    cookies=cookies,
                     proxies=proxies,
                     timeout=self.timeout,
                     stream=stream,
