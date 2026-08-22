@@ -22,9 +22,10 @@ import time
 import signal
 import logging
 import threading
+import uuid
 from dataclasses import dataclass, field, replace
 
-from flask import Flask, request, Response, jsonify, stream_with_context
+from flask import Flask, g, request, Response, jsonify, stream_with_context
 from werkzeug.exceptions import HTTPException
 
 from failover import AllNodesFailed, FailoverTransport
@@ -196,6 +197,24 @@ token_optimizer = None
 shutdown_state = None
 
 
+def assign_request_id():
+    """Honor a sanitized inbound X-Request-Id, else generate one. Registered
+    before the auth gate so even rejected requests carry an id; echoed on
+    every response (after_response) and bound into error bodies/logs."""
+    raw = request.headers.get("X-Request-Id", "")
+    candidate = raw.strip()
+    if candidate and len(candidate) <= 128 and all(32 <= ord(c) < 127 for c in candidate):
+        g.request_id = candidate
+    else:
+        g.request_id = uuid.uuid4().hex
+    return None
+
+
+def echo_request_id(response):
+    response.headers["X-Request-Id"] = g.get("request_id", "")
+    return response
+
+
 def require_bearer_token():
     if not settings.auth_token or request.path in ("/health", "/ready"):
         return None
@@ -210,7 +229,8 @@ def require_bearer_token():
                 "error": {
                     "message": "Invalid or missing bearer token",
                     "type": "auth_error",
-                }
+                },
+                "request_id": g.get("request_id", ""),
             }),
             401,
             {"Content-Type": "application/json"},
@@ -232,7 +252,15 @@ class HealthLedger:
         # while calling usable(); separate locks would break that atomicity.
         self._lock = lock if lock is not None else threading.RLock()
         self._state = {
-            n.node_id: {"consecutive_failures": 0, "fail_until": 0.0}
+            n.node_id: {
+                "consecutive_failures": 0,
+                "fail_until": 0.0,
+                # Lifetime attempt outcomes (observability): recorded at the
+                # same lock-guarded sites as health state so a report can't
+                # tear them apart. reset_all() deliberately preserves these.
+                "total_successes": 0,
+                "total_failures": 0,
+            }
             for n in nodes
         }
 
@@ -261,8 +289,9 @@ class HealthLedger:
             return self._entry(node)["consecutive_failures"]
 
     def health_state(self, now=None):
-        """All nodes' {consecutive_failures, cooldown_seconds} under one lock
-        and a single clock reading, so a report can't tear the pair apart."""
+        """All nodes' {consecutive_failures, cooldown_seconds, lifetime
+        totals} under one lock and a single clock reading, so a report can't
+        tear the pair apart."""
         if now is None:
             now = time.monotonic()
         with self._lock:
@@ -270,6 +299,8 @@ class HealthLedger:
                 nid: {
                     "consecutive_failures": e["consecutive_failures"],
                     "cooldown_seconds": round(max(0.0, e["fail_until"] - now), 3),
+                    "total_successes": e["total_successes"],
+                    "total_failures": e["total_failures"],
                 }
                 for nid, e in self._state.items()
             }
@@ -279,6 +310,7 @@ class HealthLedger:
             entry = self._entry(node)
             entry["consecutive_failures"] = 0
             entry["fail_until"] = 0.0
+            entry["total_successes"] += 1
 
     def record_failure(self, node, now=None):
         if now is None:
@@ -286,6 +318,7 @@ class HealthLedger:
         with self._lock:
             entry = self._entry(node)
             entry["consecutive_failures"] += 1
+            entry["total_failures"] += 1
             cooldown = min(
                 self._cooldown_max,
                 self._cooldown_base * (2 ** (entry["consecutive_failures"] - 1)),
@@ -344,6 +377,8 @@ def node_health_snapshot(nodes, ledger, now=None):
         "proxy": n.proxy,
         "consecutive_failures": state[n.node_id]["consecutive_failures"],
         "cooldown_seconds": state[n.node_id]["cooldown_seconds"],
+        "total_successes": state[n.node_id]["total_successes"],
+        "total_failures": state[n.node_id]["total_failures"],
     } for n in nodes]
 
 
@@ -397,7 +432,9 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
     application.add_url_rule("/health", "health_check", health_check)
     application.add_url_rule("/ready", "ready_check", ready_check)
     application.add_url_rule("/v1/models", "list_models", list_models)
+    application.before_request(assign_request_id)
     application.before_request(require_bearer_token)
+    application.after_request(echo_request_id)
     application.register_error_handler(Exception, handle_exception)
     app = application
     return app
@@ -1212,7 +1249,8 @@ def dynamic_failover_proxy(path):
                     "message": "Proxy Gateway Error: All backend nodes exhausted or rate-limited",
                     "type": "gateway_error",
                     "last_error": result.last_error
-                }
+                },
+                "request_id": g.get("request_id", ""),
             }),
             502,
             {"Content-Type": "application/json"}
@@ -1280,7 +1318,10 @@ def list_models():
     )
     if isinstance(result, AllNodesFailed):
         logger.error(f"Failed to fetch models: {result.last_error}")
-        return jsonify({"error": "Failed to fetch models from upstream"}), 502
+        return jsonify({
+            "error": "Failed to fetch models from upstream",
+            "request_id": g.get("request_id", ""),
+        }), 502
     return Response(result.body(), result.status_code, result.header_pairs)
 
 
@@ -1293,7 +1334,8 @@ def handle_exception(e):
         "error": {
             "message": "Internal proxy error",
             "type": "internal_error"
-        }
+        },
+        "request_id": g.get("request_id", ""),
     }), 500
 
 
