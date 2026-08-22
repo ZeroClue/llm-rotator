@@ -40,6 +40,7 @@ Production runs use gunicorn (`gunicorn.conf.py`, gthread workers): `gunicorn -c
 - **`.gitignore` now has real patterns** (`.env`, `__pycache__/`, `FINDINGS.md`, caches) — but `__pycache__/` was committed earlier and stays tracked until `git rm -r --cached __pycache__` is run; ignore rules don't untrack files.
 - First startup with tiktoken downloads the tokenizer file for the default model unless cached — the Docker image pre-bakes it via `TIKTOKEN_CACHE_DIR`; bare-metal first runs need network or a warm cache.
 - llmlingua is intentionally absent from requirements.txt (pulls torch, ~2GB); install separately only if `ENABLE_SEMANTIC_COMPRESSION=true` is wanted.
+- **Keep `STREAM_DRAIN_WINDOW` below `GUNICORN_GRACEFUL_TIMEOUT`** — the terminal SSE event must flush before gunicorn's hard kill. Arming rides SIGTERM/SIGINT handlers chained by `create_app()` because gunicorn 26.1.0's `worker_int` hook never fires on SIGTERM (only INT/QUIT; verified in pinned source). That install must run on the main thread, so `--preload` (unused here) would break it.
 
 ## Testing
 

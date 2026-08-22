@@ -55,3 +55,19 @@ from the cursor, which only tracks pool position.
 **Never-starve rule**:
 When every node is in cooldown, rotation uses the cursor node anyway rather
 than rejecting the request.
+
+**Draining**:
+The state after a shutdown signal: in-flight streams keep flowing until the
+drain window elapses, then each is ended with a terminal SSE event. The
+window binds every stream equally, whatever its start time.
+
+**Drain window**:
+The bounded period after a shutdown signal during which in-flight streams may
+finish naturally; measured from the signal, sized by `STREAM_DRAIN_WINDOW`,
+and kept shorter than gunicorn's graceful timeout so termination is ours,
+not the killer's.
+
+**Terminal SSE event**:
+The well-formed OpenAI-style error object plus `data: [DONE]` a stream ends
+with when draining cuts it — distinguishable from a complete answer and
+parseable by standard clients.

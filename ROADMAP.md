@@ -55,13 +55,23 @@ failure→cooldown→skip→expiry covered deterministically via a stepped virtu
 
 ## Next (real work, plan before starting)
 
-### 4. Graceful stream draining — `todo`
+### 4. Graceful stream draining — `done` (2026-08-22, issue #30)
 On SIGTERM/gunicorn graceful shutdown, in-flight SSE completions are cut at
 `graceful_timeout`. Options: short `Retry-After`-style SSE error event before cut,
 or hold shutdown until streams finish with a bounded drain window env var
 (`GUNICORN_GRACEFUL_TIMEOUT` already plumbed).
+Amendment: finish-first draining — streams pump until natural completion or
+`STREAM_DRAIN_WINDOW` (default 20s, kept below graceful_timeout), then end with a
+terminal SSE event (OpenAI-style error + `[DONE]`). Fact-find against pinned
+gunicorn 26.1.0 showed `worker_int` never fires on SIGTERM (only INT/QUIT), so
+arming is chained SIGTERM/SIGINT handlers installed in `create_app()` — under
+gunicorn they delegate to the worker's own handler; the bare dev server gets a
+drain-wait-then-exit watchdog (with a settle beat so guards flush the event).
+Guard lives in the view layer; ADR 0001.
 *Acceptance:* integration test: start stream, SIGTERM master, client either receives
-the full body within the drain window or a well-formed terminal SSE event.
+the full body within the drain window or a well-formed terminal SSE event — landed
+as `tests/test_graceful_shutdown_live.py` (gunicorn full-body path, gunicorn cut
+path before hard kill, dev-server parity).
 
 ### 5. Idempotency-aware retry policy — `done` (2026-08-22)
 Today POSTs are retried verbatim on 502/503/504 — a 504 may mean upstream completed
