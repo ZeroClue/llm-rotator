@@ -4,6 +4,8 @@ import os
 import subprocess
 import sys
 
+import dataclasses
+
 import pytest
 
 
@@ -234,7 +236,7 @@ def test_snapshot_reports_remaining_cooldown(rotator):
 
 
 def test_auth_token_rejects_missing_header(rotator, monkeypatch, client, chat_captures):
-    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    monkeypatch.setattr(rotator, "settings", dataclasses.replace(rotator.settings, auth_token="sekrit"))
     before = len(chat_captures())
     resp = client.post(
         "/v1/chat/completions",
@@ -245,7 +247,7 @@ def test_auth_token_rejects_missing_header(rotator, monkeypatch, client, chat_ca
 
 
 def test_auth_token_gates_wrong_and_admits_correct(rotator, monkeypatch, client, chat_captures):
-    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    monkeypatch.setattr(rotator, "settings", dataclasses.replace(rotator.settings, auth_token="sekrit"))
     before = len(chat_captures())
     wrong = client.post(
         "/v1/chat/completions",
@@ -264,7 +266,7 @@ def test_auth_token_gates_wrong_and_admits_correct(rotator, monkeypatch, client,
 
 
 def test_auth_token_non_ascii_header_gets_401_not_500(rotator, monkeypatch, client):
-    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    monkeypatch.setattr(rotator, "settings", dataclasses.replace(rotator.settings, auth_token="sekrit"))
     resp = client.post(
         "/v1/chat/completions",
         json={"model": "gpt-4o", "messages": BASIC_MESSAGES},
@@ -274,14 +276,14 @@ def test_auth_token_non_ascii_header_gets_401_not_500(rotator, monkeypatch, clie
 
 
 def test_health_stays_open_with_auth_enabled(rotator, monkeypatch, client):
-    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    monkeypatch.setattr(rotator, "settings", dataclasses.replace(rotator.settings, auth_token="sekrit"))
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.get_json()["status"] == "healthy"
 
 
 def test_auth_disabled_by_default(rotator, monkeypatch, client):
-    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "")
+    monkeypatch.setattr(rotator, "settings", dataclasses.replace(rotator.settings, auth_token=""))
     resp = client.post(
         "/v1/chat/completions",
         json={"model": "gpt-4o", "messages": BASIC_MESSAGES},
@@ -290,7 +292,7 @@ def test_auth_disabled_by_default(rotator, monkeypatch, client):
 
 
 def test_models_endpoint_requires_token_too(rotator, monkeypatch, client):
-    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    monkeypatch.setattr(rotator, "settings", dataclasses.replace(rotator.settings, auth_token="sekrit"))
     assert client.get("/v1/models").status_code == 401
 
 
@@ -322,7 +324,7 @@ def test_ready_flips_503_when_all_nodes_cooling(rotator, client):
 
 
 def test_ready_stays_open_with_auth_enabled(rotator, monkeypatch, client):
-    monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
+    monkeypatch.setattr(rotator, "settings", dataclasses.replace(rotator.settings, auth_token="sekrit"))
     assert client.get("/ready").status_code == 200
 
 
@@ -348,23 +350,14 @@ def test_streamed_response_headers_are_sanitized(client):
     assert "part4" in body and "[DONE]" in body
 
 
-def test_log_level_env_var_is_effective():
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def test_log_level_env_var_is_effective(rotator):
+    import logging
 
-    def debug_enabled(level):
-        env = os.environ.copy()
-        env.update({
-            "LOG_LEVEL": level,
-            "PROXY_1_URL": "socks5h://127.0.0.1:9",
-            "API_KEY_1": "dummy",
-        })
-        code = "import logging, rotator; print(logging.getLogger('rotator').isEnabledFor(logging.DEBUG))"
-        out = subprocess.run(
-            [sys.executable, "-c", code],
-            env=env, cwd=repo_root, capture_output=True, text=True, timeout=30,
-        )
-        assert out.returncode == 0, out.stderr
-        return out.stdout.strip()
+    debug_settings = dataclasses.replace(rotator.settings, log_level="DEBUG")
+    info_settings = dataclasses.replace(rotator.settings, log_level="INFO")
 
-    assert debug_enabled("DEBUG") == "True"
-    assert debug_enabled("INFO") == "False"
+    rotator.configure_logging(debug_settings)
+    assert logging.getLogger().isEnabledFor(logging.DEBUG) is True
+
+    rotator.configure_logging(info_settings)
+    assert logging.getLogger().isEnabledFor(logging.DEBUG) is False

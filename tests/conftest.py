@@ -1,9 +1,9 @@
-import importlib
 import json
 import os
 import sys
 
 import pytest
+import rotator as rotator_module
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -21,13 +21,16 @@ def mock():
 
 @pytest.fixture(scope="session")
 def rotator(mock):
+    # Importing rotator builds nothing; the first get_app() below constructs
+    # settings -> services -> app from this process's environment.
     os.environ["PROXY_1_URL"] = "http://127.0.0.1:1"
     os.environ["API_KEY_1"] = "node-one-key"
     os.environ["PROXY_2_URL"] = f"http://127.0.0.1:{mock.port}"
     os.environ["API_KEY_2"] = "node-two-key"
     os.environ["LLM_PROVIDER_URL"] = mock.url("/v1")
     os.environ["MAX_RETRIES"] = "6"
-    return importlib.import_module("rotator")
+    rotator_module.get_app()
+    return rotator_module
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +55,7 @@ def build_optimizer(rotator, **overrides):
         if overrides
         else rotator.OPTIMIZATION_CONFIG
     )
-    return rotator.TokenOptimizer(config=cfg, model_name=rotator.DEFAULT_MODEL)
+    return rotator.TokenOptimizer(config=cfg, model_name=rotator.settings.default_model)
 
 
 @pytest.fixture()
