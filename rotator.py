@@ -23,6 +23,7 @@ import signal
 import logging
 import threading
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
 
 from flask import Flask, g, request, Response, jsonify, stream_with_context
@@ -81,6 +82,9 @@ class Settings:
     # Optional bearer-token gate. Empty disables auth entirely. /health and
     # /ready stay open either way so orchestrators can probe without the token.
     auth_token: str = ""
+    # "text" keeps the classic human format; "json" emits one structured
+    # object per line (see JsonFormatter).
+    log_format: str = "text"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -99,15 +103,50 @@ class Settings:
             stream_drain_window=float(os.getenv("STREAM_DRAIN_WINDOW", "20.0")),
             default_model=os.getenv("DEFAULT_MODEL", "gpt-4o"),
             auth_token=os.getenv("PROXY_AUTH_TOKEN", ""),
+            log_format=os.getenv("LOG_FORMAT", "text"),
         )
+
+
+class JsonFormatter(logging.Formatter):
+    """One JSON object per log line: a stable envelope (ts/level/logger/
+    message) plus whatever structured extras the call site attached. Prose
+    messages are preserved verbatim inside `message`."""
+
+    # LogRecord attributes that belong to the envelope or the logging
+    # machinery itself; everything else on the record is an extra.
+    _ENVELOPE = frozenset({
+        "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+        "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+        "created", "msecs", "relativeCreated", "thread", "threadName",
+        "processName", "process", "taskName", "message", "asctime",
+    })
+
+    def format(self, record):
+        entry = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key not in self._ENVELOPE:
+                entry[key] = value
+        if record.exc_info:
+            entry["exc"] = self.formatException(record.exc_info)
+        return json.dumps(entry, default=str)
 
 
 def configure_logging(settings):
     """(Re)apply root logging config; safe to call per app build."""
+    formatter = JsonFormatter() if settings.log_format == "json" else None
+    handler = logging.StreamHandler()
+    if formatter is not None:
+        handler.setFormatter(formatter)
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format='%(asctime)s [%(levelname)s] %(message)s',
         force=True,
+        handlers=[handler],
     )
 
 

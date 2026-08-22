@@ -2,6 +2,7 @@ import json
 import logging
 import sys
 import os
+from dataclasses import replace
 
 import pytest
 
@@ -184,3 +185,62 @@ class TestStructuredLifecycleLogs:
         entries = [r for r in caplog.records if getattr(r, "event", None) == "proxy_request"]
         assert entries and entries[0].request_id == "trace-7"
         assert entries[0].path == "chat/completions"
+
+
+class TestJsonLogging:
+    def test_settings_default_text(self, monkeypatch):
+        from rotator import Settings
+
+        monkeypatch.delenv("LOG_FORMAT", raising=False)
+        assert Settings.from_env().log_format == "text"
+
+    def test_settings_json_env(self, monkeypatch):
+        from rotator import Settings
+
+        monkeypatch.setenv("LOG_FORMAT", "json")
+        assert Settings.from_env().log_format == "json"
+
+    def test_json_formatter_envelope_and_extras(self):
+        from rotator import JsonFormatter
+
+        record = logging.LogRecord(
+            "failover", logging.INFO, __file__, 1,
+            "Attempt 1/4: Routing via Node 1", (), None,
+        )
+        record.event = "upstream_attempt"
+        record.node_id = 1
+        record.attempt = 1
+        record.request_id = "corr-1"
+        out = json.loads(JsonFormatter().format(record))
+        assert out["message"] == "Attempt 1/4: Routing via Node 1"
+        assert out["level"] == "INFO"
+        assert out["logger"] == "failover"
+        assert out["event"] == "upstream_attempt"
+        assert out["node_id"] == 1 and out["attempt"] == 1
+        assert out["request_id"] == "corr-1"
+
+    def test_json_formatter_ts_is_iso8601(self):
+        from datetime import datetime
+
+        from rotator import JsonFormatter
+
+        record = logging.LogRecord("rotator", logging.WARNING, __file__, 1, "w", (), None)
+        out = json.loads(JsonFormatter().format(record))
+        datetime.fromisoformat(out["ts"])
+
+    def test_configure_logging_installs_json_formatter(self):
+        from rotator import Settings, configure_logging
+
+        configure_logging(replace(Settings.from_env(), log_format="json"))
+        root = logging.getLogger()
+        assert any(getattr(h, "formatter", None).__class__.__name__ == "JsonFormatter"
+                   for h in root.handlers)
+
+    def test_configure_logging_text_keeps_default_formatter(self, monkeypatch):
+        from rotator import Settings, configure_logging
+
+        cfg = Settings.from_env()
+        configure_logging(replace(cfg, log_format="text"))
+        root = logging.getLogger()
+        assert any(getattr(h, "formatter", None).__class__.__name__ != "JsonFormatter"
+                   for h in root.handlers)
