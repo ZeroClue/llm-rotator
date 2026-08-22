@@ -45,5 +45,24 @@ def client(rotator):
 
 
 @pytest.fixture()
+def make_optimizer(rotator, monkeypatch):
+    """Build a fresh TokenOptimizer with explicit OptimizationConfig overrides
+    and swap it in as the module-level optimizer the view resolves."""
+    import dataclasses
+
+    def _make(**overrides):
+        cfg = (
+            dataclasses.replace(rotator.OPTIMIZATION_CONFIG, **overrides)
+            if overrides
+            else rotator.OPTIMIZATION_CONFIG
+        )
+        opt = rotator.TokenOptimizer(config=cfg, model_name=rotator.DEFAULT_MODEL)
+        monkeypatch.setattr(rotator, "token_optimizer", opt)
+        return opt
+
+    return _make
+
+
+@pytest.fixture()
 def chat_captures(mock):
     return mock.chat_posts
