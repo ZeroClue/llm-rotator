@@ -8,7 +8,8 @@ server errors, and timeouts.
 
 **Node**:
 One upstream target: an egress paired with the API key to spend through it,
-identified by `node_id`.
+identified by `node_id`, a stable 1-based integer fixed when the pool is built.
+A node carries no failure history itself; that lives in the health ledger.
 _Avoid_: upstream, backend, host
 
 **Egress**:
@@ -38,6 +39,11 @@ usable node instead of returning the error to the client.
 **Cooldown**:
 The period after a node failure during which rotation skips that node;
 grows exponentially with consecutive failures up to a cap.
+
+**Health ledger**:
+The per-node record of consecutive failures and cooldown deadlines — the
+authority rotation consults to decide whether a node is usable. Distinct
+from the cursor, which only tracks pool position.
 
 **Never-starve rule**:
 When every node is in cooldown, rotation uses the cursor node anyway rather
