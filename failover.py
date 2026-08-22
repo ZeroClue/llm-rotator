@@ -29,8 +29,9 @@ _HOP_BY_HOP_HEADERS = frozenset({
 # Client headers that must never be forwarded upstream; Authorization is
 # injected per attempt and anything host/framing/cookie-related is the
 # transport's business, not the client's. Cookies especially: they would ride
-# whatever egress node the request rotates through.
-_OUTBOUND_DROPPED_HEADERS = frozenset({"host", "content-length", "cookie"})
+# whatever egress node the request rotates through. X-Request-Id is a
+# proxy-local correlation handle by contract (issue #34) — it never leaks.
+_OUTBOUND_DROPPED_HEADERS = frozenset({"host", "content-length", "cookie", "x-request-id"})
 
 
 class _NoStoreCookiePolicy(http.cookiejar.DefaultCookiePolicy):
@@ -165,6 +166,11 @@ class FailoverTransport:
             failed = False
             next_action = ("not retrying: RETRY_POSTS=false" if single_shot_post
                            else "Retrying...")
+            failure_extras = lambda reason, **kw: {  # noqa: E731
+                **log_extras, "event": "upstream_failure",
+                "node_id": node.node_id, "attempt": attempt + 1,
+                "reason": reason, **kw,
+            }
             try:
                 response = self.session.request(
                     method=method,
@@ -178,8 +184,7 @@ class FailoverTransport:
             except Timeout as e:
                 logger.error(
                     f"Timeout on Node {node.node_id}: {str(e)}. {next_action}",
-                    extra={**log_extras, "event": "upstream_failure", "node_id": node.node_id,
-                           "attempt": attempt + 1, "reason": "timeout"},
+                    extra=failure_extras("timeout"),
                 )
                 last_error = f"Timeout: {str(e)}"
                 self.ledger.record_failure(node)
@@ -187,8 +192,7 @@ class FailoverTransport:
             except ConnectionError as e:
                 logger.error(
                     f"Connection error on Node {node.node_id}: {str(e)}. {next_action}",
-                    extra={**log_extras, "event": "upstream_failure", "node_id": node.node_id,
-                           "attempt": attempt + 1, "reason": "connection_error"},
+                    extra=failure_extras("connection_error"),
                 )
                 last_error = f"Connection error: {str(e)}"
                 self.ledger.record_failure(node)
@@ -196,8 +200,7 @@ class FailoverTransport:
             except RequestException as e:
                 logger.error(
                     f"Request failed on Node {node.node_id}: {str(e)}. {next_action}",
-                    extra={**log_extras, "event": "upstream_failure", "node_id": node.node_id,
-                           "attempt": attempt + 1, "reason": "request_error"},
+                    extra=failure_extras("request_error"),
                 )
                 last_error = f"Request error: {str(e)}"
                 self.ledger.record_failure(node)
@@ -207,9 +210,7 @@ class FailoverTransport:
                     logger.warning(
                         f"Node {node.node_id} returned HTTP {response.status_code}. "
                         f"{next_action}",
-                        extra={**log_extras, "event": "upstream_failure", "node_id": node.node_id,
-                               "attempt": attempt + 1, "reason": "retryable_status",
-                               "status_code": response.status_code},
+                        extra=failure_extras("retryable_status", status_code=response.status_code),
                     )
                     last_error = f"Upstream error: {response.status_code}"
                     retry_after = parse_retry_after(response.headers.get("Retry-After"))

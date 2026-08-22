@@ -85,10 +85,8 @@ class TestRequestId:
         assert rid != evil and len(rid) == 32
 
     def test_auth_error_carries_id_in_header_and_body(self, rotator, monkeypatch, client):
-        import dataclasses
-
         monkeypatch.setattr(rotator, "settings",
-                            dataclasses.replace(rotator.settings, auth_token="sekrit"))
+                            replace(rotator.settings, auth_token="sekrit"))
         resp = client.post("/v1/chat/completions", json={},
                            headers={"X-Request-Id": "corr-42"})
         assert resp.status_code == 401
@@ -97,7 +95,6 @@ class TestRequestId:
 
     def test_gateway_error_body_carries_request_id(self, rotator, client, monkeypatch):
         """All-nodes-exhausted 502 names the request id in its JSON body."""
-        from failover import AllNodesFailed
         import rotator as rotator_module
 
         class ExhaustedTransport:
@@ -289,3 +286,64 @@ class TestMetrics:
         monkeypatch.setattr(rotator, "settings",
                             replace(rotator.settings, auth_token="sekrit"))
         assert client.get("/metrics").status_code == 200
+
+
+class TestReviewFixes:
+    def test_inbound_request_id_never_reaches_upstream(self, mock, client):
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Request-Id": "client-trace-1"},
+        )
+        assert resp.status_code == 200
+        captured_headers = mock.chat_posts()[-1]["headers"]
+        assert not any(k.lower() == "x-request-id" for k in captured_headers)
+
+    def test_all_nodes_failed_log_carries_attempts(self, rotator, client, caplog, monkeypatch):
+        import rotator as rotator_module
+
+        class ExhaustedTransport:
+            def send(self, *args, **kwargs):
+                return AllNodesFailed(last_error="boom", attempts=4)
+
+        monkeypatch.setattr(rotator_module, "transport", ExhaustedTransport())
+        with caplog.at_level(logging.CRITICAL, logger="rotator"):
+            resp = client.post(
+                "/v1/chat/completions",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+                headers={"X-Request-Id": "corr-x"},
+            )
+        assert resp.status_code == 502
+        events = [r for r in caplog.records if getattr(r, "event", None) == "all_nodes_failed"]
+        assert events and events[0].attempts == 4
+        assert events[0].request_id == "corr-x"
+
+    def test_token_usage_log_carries_counts(self, client, caplog):
+        with caplog.at_level(logging.INFO, logger="rotator"):
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+            )
+        usage_events = [
+            r for r in caplog.records if getattr(r, "event", None) == "token_usage"
+        ]
+        assert usage_events
+        assert usage_events[0].total_tokens == 10
+
+    def test_unhandled_exception_log_carries_request_id(self, rotator, client, caplog, monkeypatch):
+        import rotator as rotator_module
+
+        class ExplodingTransport:
+            def send(self, *args, **kwargs):
+                raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(rotator_module, "transport", ExplodingTransport())
+        with caplog.at_level(logging.ERROR, logger="rotator"):
+            resp = client.post(
+                "/v1/chat/completions",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+                headers={"X-Request-Id": "corr-boom"},
+            )
+        assert resp.status_code == 500
+        records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert records and getattr(records[0], "request_id", "") == "corr-boom"

@@ -138,13 +138,16 @@ class JsonFormatter(logging.Formatter):
 
 def configure_logging(settings):
     """(Re)apply root logging config; safe to call per app build."""
-    formatter = JsonFormatter() if settings.log_format == "json" else None
+    if settings.log_format == "json":
+        formatter = JsonFormatter()
+    else:
+        # Explicit so text output stays byte-identical regardless of how
+        # handlers are attached below.
+        formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
     handler = logging.StreamHandler()
-    if formatter is not None:
-        handler.setFormatter(formatter)
+    handler.setFormatter(formatter)
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format='%(asctime)s [%(levelname)s] %(message)s',
         force=True,
         handlers=[handler],
     )
@@ -1292,7 +1295,9 @@ def dynamic_failover_proxy(path):
     if isinstance(result, AllNodesFailed):
         logger.critical(
             f"All retry attempts exhausted ({result.attempts} attempt(s), "
-            f"MAX_RETRIES={settings.max_retries}). Last error: {result.last_error}"
+            f"MAX_RETRIES={settings.max_retries}). Last error: {result.last_error}",
+            extra={"event": "all_nodes_failed", "request_id": request_id,
+                   "attempts": result.attempts, "max_retries": settings.max_retries},
         )
         return Response(
             json.dumps({
@@ -1324,7 +1329,12 @@ def dynamic_failover_proxy(path):
                 logger.info(
                     f"Token usage - Prompt: {usage.get('prompt_tokens', 'N/A')}, "
                     f"Completion: {usage.get('completion_tokens', 'N/A')}, "
-                    f"Total: {usage.get('total_tokens', 'N/A')}"
+                    f"Total: {usage.get('total_tokens', 'N/A')}",
+                    extra={"event": "token_usage", "request_id": request_id,
+                           "node_id": result.node_id,
+                           "prompt_tokens": usage.get("prompt_tokens"),
+                           "completion_tokens": usage.get("completion_tokens"),
+                           "total_tokens": usage.get("total_tokens")},
                 )
         except Exception:
             pass
@@ -1343,6 +1353,9 @@ def metrics():
     usable-node gauge. Hand-rolled on purpose: the format for two counters
     and one gauge is ~15 lines, not a dependency."""
     state = health_ledger.health_state()
+    # Recompute from the same `state` snapshot rather than calling
+    # nodes_available_count(): one lock/clock read keeps gauge and counters
+    # from tearing apart.
     available = sum(1 for e in state.values() if e["cooldown_seconds"] <= 0)
     lines = [
         "# HELP llm_rotator_node_requests_total Lifetime upstream attempt outcomes per node.",
@@ -1408,7 +1421,11 @@ def handle_exception(e):
     """Global exception handler; HTTP errors keep their own status codes."""
     if isinstance(e, HTTPException):
         return e
-    logger.exception(f"Unhandled exception: {e}")
+    logger.exception(
+        f"Unhandled exception: {e}",
+        extra={"event": "unhandled_exception",
+               "request_id": g.get("request_id", "")},
+    )
     return jsonify({
         "error": {
             "message": "Internal proxy error",
