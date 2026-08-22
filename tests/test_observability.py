@@ -244,3 +244,48 @@ class TestJsonLogging:
         root = logging.getLogger()
         assert any(getattr(h, "formatter", None).__class__.__name__ != "JsonFormatter"
                    for h in root.handlers)
+
+
+class TestMetrics:
+    def test_metrics_lines_match_ledger_state(self, rotator, client):
+        """Delta-based: counters are process-lifetime and deliberately
+        survive reset_all(), so compare against a baseline scrape."""
+        import rotator as rotator_module
+
+        def counters(body):
+            out = {}
+            for line in body.splitlines():
+                if line.startswith("llm_rotator_node_requests_total{"):
+                    labels, value = line.split("} ", 1)
+                    nid = labels.split('node_id="')[1].split('"')[0]
+                    outcome = labels.split('outcome="')[1].split('"')[0]
+                    out[(int(nid), outcome)] = int(value)
+            return out
+
+        before = counters(client.get("/metrics").data.decode())
+        ledger = rotator_module.health_ledger
+        nodes = {n.node_id: n for n in rotator_module.NODE_POOL}
+        ledger.record_success(nodes[1])
+        ledger.record_success(nodes[1])
+        ledger.record_failure(nodes[2])
+
+        resp = client.get("/metrics")
+        assert resp.status_code == 200
+        assert "text/plain" in resp.headers["Content-Type"]
+        body = resp.data.decode()
+        assert "# TYPE llm_rotator_node_requests_total counter" in body
+        after = counters(body)
+        assert after[(1, "success")] == before.get((1, "success"), 0) + 2
+        assert after[(2, "failure")] == before.get((2, "failure"), 0) + 1
+
+    def test_metrics_gauge_counts_usable_nodes(self, rotator, client):
+        resp = client.get("/metrics")
+        body = resp.data.decode()
+        line = next(l for l in body.splitlines() if l.startswith("llm_rotator_nodes_available "))
+        value = int(line.rsplit(" ", 1)[1])
+        assert 0 <= value <= len(rotator.NODE_POOL)
+
+    def test_metrics_stays_open_with_auth_enabled(self, rotator, monkeypatch, client):
+        monkeypatch.setattr(rotator, "settings",
+                            replace(rotator.settings, auth_token="sekrit"))
+        assert client.get("/metrics").status_code == 200

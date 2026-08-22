@@ -255,7 +255,7 @@ def echo_request_id(response):
 
 
 def require_bearer_token():
-    if not settings.auth_token or request.path in ("/health", "/ready"):
+    if not settings.auth_token or request.path in ("/health", "/ready", "/metrics"):
         return None
     provided = request.headers.get("Authorization", "")
     # Bytes, not str: compare_digest raises TypeError on non-ASCII str, and
@@ -470,6 +470,7 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
     )
     application.add_url_rule("/health", "health_check", health_check)
     application.add_url_rule("/ready", "ready_check", ready_check)
+    application.add_url_rule("/metrics", "metrics", metrics)
     application.add_url_rule("/v1/models", "list_models", list_models)
     application.before_request(assign_request_id)
     application.before_request(require_bearer_token)
@@ -1335,6 +1336,33 @@ def nodes_available_count():
     """Nodes not currently in cooldown, per the ledger's own clock."""
     state = health_ledger.health_state()
     return sum(1 for e in state.values() if e["cooldown_seconds"] <= 0)
+
+
+def metrics():
+    """Prometheus text exposition of the per-node lifetime counters and a
+    usable-node gauge. Hand-rolled on purpose: the format for two counters
+    and one gauge is ~15 lines, not a dependency."""
+    state = health_ledger.health_state()
+    available = sum(1 for e in state.values() if e["cooldown_seconds"] <= 0)
+    lines = [
+        "# HELP llm_rotator_node_requests_total Lifetime upstream attempt outcomes per node.",
+        "# TYPE llm_rotator_node_requests_total counter",
+    ]
+    for nid in sorted(state):
+        lines.append(
+            f'llm_rotator_node_requests_total{{node_id="{nid}",outcome="success"}} '
+            f'{state[nid]["total_successes"]}'
+        )
+        lines.append(
+            f'llm_rotator_node_requests_total{{node_id="{nid}",outcome="failure"}} '
+            f'{state[nid]["total_failures"]}'
+        )
+    lines.extend([
+        "# HELP llm_rotator_nodes_available Nodes not currently in cooldown.",
+        "# TYPE llm_rotator_nodes_available gauge",
+        f"llm_rotator_nodes_available {available}",
+    ])
+    return Response("\n".join(lines) + "\n", mimetype="text/plain")
 
 
 def health_check():

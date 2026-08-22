@@ -195,7 +195,7 @@ or HTTP.
 
 ## Later (nice-to-have / strategic)
 
-### 9. Observability — `in progress` (2026-08-22, issue #34)
+### 9. Observability — `done` (2026-08-22, issue #34)
 Request IDs (generate + echo via header), structured logging (JSON option),
 per-node success/failure counters exposed in `/health`, optional Prometheus
 endpoint. Prerequisite for operating multi-node pools with confidence.
