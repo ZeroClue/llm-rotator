@@ -53,8 +53,8 @@ def test_default_config_does_not_inject_cache_control(client, chat_captures):
     assert isinstance(sent["messages"][0]["content"], str)
 
 
-def test_explicit_prompt_caching_adds_valid_markers(client, chat_captures, rotator, monkeypatch):
-    monkeypatch.setattr(rotator, "ENABLE_PROMPT_CACHING", True)
+def test_explicit_prompt_caching_adds_valid_markers(client, chat_captures, make_optimizer):
+    make_optimizer(enable_prompt_caching=True)
     resp = client.post("/v1/chat/completions", json={"model": "gpt-4o", "messages": BASIC_MESSAGES})
     assert resp.status_code == 200
     sent = jload(chat_captures()[-1]["body"])
@@ -86,41 +86,8 @@ def test_cache_hit_respects_client_max_tokens(client, chat_captures, caplog):
     assert any("Cache hit" in r.getMessage() for r in caplog.records)
 
 
-def test_context_cache_is_lru_bounded(rotator, monkeypatch):
-    from collections import OrderedDict
-    monkeypatch.setattr(rotator, "CONTEXT_CACHE_SIZE", 2)
-    opt = rotator.token_optimizer
-    assert isinstance(opt.context_cache, OrderedDict)
-    opt._cache_result("k1", {"messages": [], "tokens_saved": 0})
-    opt._cache_result("k2", {"messages": [], "tokens_saved": 0})
-    assert opt._get_cached("k1") is not None
-    opt._cache_result("k3", {"messages": [], "tokens_saved": 0})
-    assert opt._get_cached("k1") is not None
-    assert opt._get_cached("k2") is None
-    assert opt._get_cached("k3") is not None
-    assert len(opt.context_cache) <= 2
-
-
-def test_importance_filter_preserves_system_and_alternation(rotator):
-    msgs = (
-        [{"role": "system", "content": "Be helpful."}]
-        + [{"role": "user", "content": f"q{i}"} for i in range(1)]
-        + [{"role": "assistant", "content": "a1"}, {"role": "user", "content": "q2"},
-           {"role": "assistant", "content": "a2"}, {"role": "user", "content": "q3"},
-           {"role": "assistant", "content": "a3"}, {"role": "user", "content": "q4"},
-           {"role": "assistant", "content": "a4"}]
-        + [{"role": "user", "content": "final question"}]
-    )
-    out = rotator.token_optimizer._filter_by_importance(msgs, 0.25)
-    roles = [m["role"] for m in out]
-    assert roles[0] == "system"
-    assert roles[-1] == "user"
-    assert all(a != b for a, b in zip(roles, roles[1:]))
-
-
-def test_importance_scoring_end_to_end_keeps_system(client, chat_captures, rotator, monkeypatch):
-    monkeypatch.setattr(rotator, "ENABLE_IMPORTANCE_SCORING", True)
-    monkeypatch.setattr(rotator, "MIN_MESSAGE_IMPORTANCE", 0.25)
+def test_importance_scoring_end_to_end_keeps_system(client, chat_captures, make_optimizer):
+    make_optimizer(enable_importance_scoring=True, min_message_importance=0.25)
     msgs = [{"role": "system", "content": "Be helpful."}] + [
         {"role": r, "content": c}
         for r, c in [("user", "q1"), ("assistant", "a1"), ("user", "q2"),
@@ -145,10 +112,10 @@ class FakeCompressor:
         return {"compressed_prompt": "ZZ" + context[0]}
 
 
-def test_semantic_compression_uses_llmlingua_api(client, chat_captures, rotator, monkeypatch):
+def test_semantic_compression_uses_llmlingua_api(client, chat_captures, make_optimizer):
+    opt = make_optimizer(enable_semantic_compression=True)
     fake = FakeCompressor()
-    monkeypatch.setattr(rotator.token_optimizer, "compressor", fake)
-    monkeypatch.setattr(rotator, "ENABLE_SEMANTIC_COMPRESSION", True)
+    opt.compressor = fake
     msgs = [
         {"role": "system", "content": "system text here"},
         {"role": "user", "content": "user text here"},

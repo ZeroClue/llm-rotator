@@ -23,7 +23,7 @@ import time
 import logging
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
 from flask import Flask, request, Response, jsonify, stream_with_context
@@ -68,60 +68,8 @@ RETRY_BACKOFF_MAX = float(os.getenv("RETRY_BACKOFF_MAX", "8.0"))
 NODE_COOLDOWN_BASE = float(os.getenv("NODE_COOLDOWN_BASE", "2.0"))
 NODE_COOLDOWN_MAX = float(os.getenv("NODE_COOLDOWN_MAX", "60.0"))
 
-# Token optimization settings
-MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "120000"))  # Reserve tokens for response
-RESERVED_RESPONSE_TOKENS = int(os.getenv("RESERVED_RESPONSE_TOKENS", "4000"))
-ENABLE_CONTEXT_COMPRESSION = os.getenv("ENABLE_CONTEXT_COMPRESSION", "true").lower() == "true"
-COMPRESSION_THRESHOLD = float(os.getenv("COMPRESSION_THRESHOLD", "0.85"))  # Compress when >85% full
-STRIP_WHITESPACE = os.getenv("STRIP_WHITESPACE", "true").lower() == "true"
-REMOVE_DUPLICATE_MESSAGES = os.getenv("REMOVE_DUPLICATE_MESSAGES", "true").lower() == "true"
-
-# Advanced compression settings (Caveman-inspired & llmlingua)
-ENABLE_SEMANTIC_COMPRESSION = os.getenv("ENABLE_SEMANTIC_COMPRESSION", "false").lower() == "true"
-SEMANTIC_COMPRESSION_RATIO = float(os.getenv("SEMANTIC_COMPRESSION_RATIO", "0.5"))  # Target 50% compression
-_ENABLE_PROMPT_CACHING_RAW = os.getenv("ENABLE_PROMPT_CACHING")
-ENABLE_PROMPT_CACHING = (_ENABLE_PROMPT_CACHING_RAW or "false").strip().lower() == "true"
-ENABLE_IMPORTANCE_SCORING = os.getenv("ENABLE_IMPORTANCE_SCORING", "false").lower() == "true"
-MIN_MESSAGE_IMPORTANCE = float(os.getenv("MIN_MESSAGE_IMPORTANCE", "0.3"))  # Drop messages below this score
-ENABLE_RECURSIVE_SUMMARIZATION = os.getenv("ENABLE_RECURSIVE_SUMMARIZATION", "false").lower() == "true"
-SUMMARIZATION_MODEL = os.getenv("SUMMARIZATION_MODEL", "gpt-4o-mini")  # Model for summarization
-
-# Streaming and performance settings
-ENABLE_STREAMING_FASTPATH = os.getenv("ENABLE_STREAMING_FASTPATH", "true").lower() == "true"
-ENABLE_CONTEXT_CACHE = os.getenv("ENABLE_CONTEXT_CACHE", "true").lower() == "true"
-CONTEXT_CACHE_SIZE = int(os.getenv("CONTEXT_CACHE_SIZE", "128"))  # LRU cache size
-
-# Provider-specific profiles
-PROVIDER_PROFILE = os.getenv("PROVIDER_PROFILE", "openai")  # openai, anthropic, groq
-PROVIDER_PROFILES = {
-    "openai": {
-        "max_context": 128000,
-        "reserved_tokens": 4096
-    },
-    "anthropic": {
-        "max_context": 200000,
-        "reserved_tokens": 8192
-    },
-    "groq": {
-        "max_context": 32000,
-        "reserved_tokens": 2048
-    }
-}
-
-# Apply provider profile
-if PROVIDER_PROFILE in PROVIDER_PROFILES:
-    _profile = PROVIDER_PROFILES[PROVIDER_PROFILE]
-    MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", str(_profile["max_context"])))
-    RESERVED_RESPONSE_TOKENS = int(os.getenv("RESERVED_RESPONSE_TOKENS", str(_profile["reserved_tokens"])))
-    logger.info(f"Applied provider profile: {PROVIDER_PROFILE} (max_context={MAX_CONTEXT_TOKENS})")
-else:
-    logger.warning(f"Unknown provider profile '{PROVIDER_PROFILE}', using defaults")
-
-# Prompt-caching marker injection is Anthropic-style and breaks OpenAI-format
-# payloads, so it never defaults on: only an explicit ENABLE_PROMPT_CACHING=true
-# enables it, regardless of profile.
-ENABLE_PROMPT_CACHING = (_ENABLE_PROMPT_CACHING_RAW or "false").strip().lower() == "true"
-
+# Token-optimization settings live in OptimizationConfig.from_env() — parsed
+# in exactly one place, next to the pipeline class below.
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,28 +294,124 @@ transport = FailoverTransport(
 # ─────────────────────────────────────────────────────────────────────────────
 # Token Management & Context Optimization Engine
 # ─────────────────────────────────────────────────────────────────────────────
+_PROVIDER_PROFILES = {
+    "openai": {"max_context": 128000, "reserved_tokens": 4096},
+    "anthropic": {"max_context": 200000, "reserved_tokens": 8192},
+    "groq": {"max_context": 32000, "reserved_tokens": 2048},
+}
+
+
+def _env_bool(raw):
+    return raw.lower() == "true"
+
+
+def _env_prompt_cache_bool(raw):
+    # Prompt-caching parsing historically stripped whitespace; keep exact.
+    return raw.strip().lower() == "true"
+
+
+@dataclass(frozen=True)
+class OptimizationConfig:
+    """Every knob of the optimization pipeline, parsed from the environment
+    in exactly one place (from_env). Tests build explicit instances instead
+    of patching globals."""
+
+    enabled: bool = True
+    streaming_fastpath: bool = True
+    remove_duplicates: bool = True
+    strip_whitespace: bool = True
+    max_context_tokens: int = 120000
+    reserved_response_tokens: int = 4000
+    enable_semantic_compression: bool = False
+    semantic_compression_ratio: float = 0.5
+    # Prompt-caching marker injection is Anthropic-style and breaks
+    # OpenAI-format payloads, so it never defaults on.
+    enable_prompt_caching: bool = False
+    enable_importance_scoring: bool = False
+    min_message_importance: float = 0.3
+    enable_recursive_summarization: bool = False
+    compression_threshold: float = 0.85
+    summarization_model: str = "gpt-4o-mini"
+    enable_context_cache: bool = True
+    context_cache_size: int = 128
+
+    @classmethod
+    def from_env(cls) -> "OptimizationConfig":
+        """Overlay environment settings onto the dataclass defaults; provider
+        profiles only supply the context-budget fallbacks."""
+        profile_name = os.getenv("PROVIDER_PROFILE", "openai")
+        profile = _PROVIDER_PROFILES.get(profile_name)
+        if profile is None:
+            logger.warning(f"Unknown provider profile '{profile_name}', using defaults")
+            base = cls()
+        else:
+            logger.info(f"Applied provider profile: {profile_name} (max_context={profile['max_context']})")
+            base = cls(
+                max_context_tokens=profile["max_context"],
+                reserved_response_tokens=profile["reserved_tokens"],
+            )
+
+        overrides = {}
+        for field_name, env_name, cast in [
+            ("enabled", "ENABLE_CONTEXT_COMPRESSION", _env_bool),
+            ("streaming_fastpath", "ENABLE_STREAMING_FASTPATH", _env_bool),
+            ("remove_duplicates", "REMOVE_DUPLICATE_MESSAGES", _env_bool),
+            ("strip_whitespace", "STRIP_WHITESPACE", _env_bool),
+            ("enable_semantic_compression", "ENABLE_SEMANTIC_COMPRESSION", _env_bool),
+            ("semantic_compression_ratio", "SEMANTIC_COMPRESSION_RATIO", float),
+            ("enable_prompt_caching", "ENABLE_PROMPT_CACHING", _env_prompt_cache_bool),
+            ("enable_importance_scoring", "ENABLE_IMPORTANCE_SCORING", _env_bool),
+            ("min_message_importance", "MIN_MESSAGE_IMPORTANCE", float),
+            ("enable_recursive_summarization", "ENABLE_RECURSIVE_SUMMARIZATION", _env_bool),
+            ("compression_threshold", "COMPRESSION_THRESHOLD", float),
+            ("summarization_model", "SUMMARIZATION_MODEL", str),
+            ("enable_context_cache", "ENABLE_CONTEXT_CACHE", _env_bool),
+            ("context_cache_size", "CONTEXT_CACHE_SIZE", int),
+        ]:
+            raw = os.getenv(env_name)
+            if raw is not None:
+                overrides[field_name] = cast(raw)
+        for field_name, env_name, cast in [
+            ("max_context_tokens", "MAX_CONTEXT_TOKENS", int),
+            ("reserved_response_tokens", "RESERVED_RESPONSE_TOKENS", int),
+        ]:
+            raw = os.getenv(env_name)
+            if raw is not None:
+                overrides[field_name] = cast(raw)
+
+        return replace(base, **overrides)
+
+
 class TokenOptimizer:
     """
-    Advanced modular token management with pluggable compression strategies.
-    
-    Pipeline Stages (all independently toggleable):
+    Modular token-management pipeline applied to chat/completions payloads.
+
+    Contract (see optimize_context): pure payload-in/payload-out — the input
+    is never mutated; the returned payload may share nothing with it. The
+    optimizer owns routing (only chat/completions paths are touched) and
+    enabling (single gate in OptimizationConfig), and it never raises for
+    request data: any internal failure logs and returns the payload
+    unoptimized rather than breaking the proxied request.
+
+    Pipeline Stages (all independently toggleable via OptimizationConfig):
     1. Structural Hygiene - Remove duplicates, strip whitespace (native Python)
     2. Semantic Compression - LLMLingua for aggressive context compression
     3. Prompt Caching - Cache control headers for Anthropic/OpenAI
     4. Importance Scoring - Caveman-inspired message prioritization
     5. Recursive Summarization - Summarize old context when needed
     6. Smart Truncation - Fallback token-based message dropping
-    
+
     Improvements:
     - Post-optimization verification to prevent double-counting
     - LRU caching for repeated context blocks
     - Streaming fast-path bypass for real-time responses
     - Provider-specific token calculations
     """
-    
-    def __init__(self, model_name="gpt-4o"):
+
+    def __init__(self, config=None, model_name="gpt-4o"):
+        self.config = config if config is not None else OptimizationConfig()
         self.model_name = model_name
-        self.summarization_model = SUMMARIZATION_MODEL
+        self.summarization_model = self.config.summarization_model
         
         # Initialize tiktoken encoder
         if TIKTOKEN_AVAILABLE:
@@ -381,19 +425,19 @@ class TokenOptimizer:
         
         # Initialize llmlingua compressor if available and enabled
         self.compressor = None
-        if LLMLINGUA_AVAILABLE and ENABLE_SEMANTIC_COMPRESSION:
+        if LLMLINGUA_AVAILABLE and self.config.enable_semantic_compression:
             try:
                 self.compressor = PromptCompressor()
                 logger.info("LLMLingua semantic compression enabled")
             except Exception as e:
                 logger.warning(f"Failed to initialize llmlingua: {e}")
                 self.compressor = None
-        
+
         # LRU cache for compressed contexts (content hash -> compressed result)
         self.context_cache = OrderedDict()
         self.cache_lock = threading.Lock()
-        if ENABLE_CONTEXT_CACHE:
-            logger.info(f"Context caching enabled (max size: {CONTEXT_CACHE_SIZE})")
+        if self.config.enable_context_cache:
+            logger.info(f"Context caching enabled (max size: {self.config.context_cache_size})")
     
     def _hash_content(self, messages: list) -> str:
         """Generate a hash key for message content caching."""
@@ -403,7 +447,7 @@ class TokenOptimizer:
     
     def _get_cached(self, hash_key: str) -> dict | None:
         """Retrieve cached optimization result if available, refreshing recency."""
-        if not ENABLE_CONTEXT_CACHE:
+        if not self.config.enable_context_cache:
             return None
         with self.cache_lock:
             result = self.context_cache.get(hash_key)
@@ -413,10 +457,10 @@ class TokenOptimizer:
 
     def _cache_result(self, hash_key: str, result: dict):
         """Cache optimization result with LRU eviction."""
-        if not ENABLE_CONTEXT_CACHE:
+        if not self.config.enable_context_cache:
             return
         with self.cache_lock:
-            if len(self.context_cache) >= CONTEXT_CACHE_SIZE:
+            if len(self.context_cache) >= self.config.context_cache_size:
                 self.context_cache.popitem(last=False)
             self.context_cache[hash_key] = result
     
@@ -463,90 +507,107 @@ class TokenOptimizer:
         total_tokens += 2
         return total_tokens
     
-    def optimize_context(self, payload: dict, is_streaming: bool = False) -> dict:
+    def optimize_context(self, payload: dict, *, path: str, is_streaming: bool = False) -> dict:
         """
         Main optimization pipeline - executes enabled stages sequentially.
-        
-        Args:
-            payload: The request payload containing messages
-            is_streaming: If True, skip expensive optimizations for low-latency streaming
-        
-        Returns:
-            Optimized payload with reduced token count
+
+        Owns routing and enabling: payloads are only touched when `path` is
+        a chat/completions endpoint and the gate in OptimizationConfig is
+        on; anything else comes back untouched (same object).
+
+        Purity: the input payload and its message dicts are never mutated —
+        each message is shallow-copied at entry, so top-level keys are
+        private to the pipeline; deeply nested values (e.g. list-typed
+        content parts) are shared until a stage rewrites them. On any
+        internal failure the input is returned unoptimized — optimization
+        must never break the proxied request.
+
+        The returned payload's max_tokens may be clamped down to fit the
+        remaining context budget (client value wins whenever it fits);
+        clamping is logged.
         """
-        if not ENABLE_CONTEXT_COMPRESSION:
+        cfg = self.config
+        if not cfg.enabled or not path.endswith("chat/completions"):
             return payload
-        
-        messages = payload.get("messages", [])
-        if not messages:
+
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        if not isinstance(messages, list) or not messages:
             return payload
-        
+
+        try:
+            logger.info(f"Applying token optimization to request... (streaming={is_streaming})")
+            return self._optimize(dict(payload), [dict(m) for m in messages], is_streaming)
+        except Exception:
+            logger.exception("Context optimization failed; forwarding payload unoptimized")
+            return payload
+
+    def _optimize(self, payload: dict, messages: list, is_streaming: bool) -> dict:
+        cfg = self.config
+
         # Fast path for streaming: skip expensive optimizations
-        if is_streaming and ENABLE_STREAMING_FASTPATH:
+        if is_streaming and cfg.streaming_fastpath:
             logger.debug("Streaming fast-path: minimal optimization applied")
-            if REMOVE_DUPLICATE_MESSAGES:
+            if cfg.remove_duplicates:
                 messages = self._remove_duplicates(messages)
-            if STRIP_WHITESPACE:
+            if cfg.strip_whitespace:
                 messages = self._strip_whitespace(messages)
-            payload["messages"] = messages
-            return payload
-        
+            return {**payload, "messages": messages}
+
         # Check cache for identical context
         content_hash = self._hash_content(messages)
         cached_result = self._get_cached(content_hash)
         if cached_result:
             logger.info(f"Cache hit: reusing optimized context (saved {cached_result.get('tokens_saved', 0)} tokens)")
-            payload["messages"] = cached_result["messages"]
-            return payload
-        
+            return {**payload, "messages": [dict(m) for m in cached_result["messages"]]}
+
         original_token_count = self.count_message_tokens(messages)
         logger.debug(f"Original message token count: {original_token_count}")
-        
+
         # Stage 1: Structural Hygiene (always runs first if enabled)
-        if REMOVE_DUPLICATE_MESSAGES:
+        if cfg.remove_duplicates:
             messages = self._remove_duplicates(messages)
-        
-        if STRIP_WHITESPACE:
+
+        if cfg.strip_whitespace:
             messages = self._strip_whitespace(messages)
-        
+
         current_token_count = self.count_message_tokens(messages)
-        available_tokens = MAX_CONTEXT_TOKENS - RESERVED_RESPONSE_TOKENS
-        
+        available_tokens = cfg.max_context_tokens - cfg.reserved_response_tokens
+
         logger.debug(
             f"After structural hygiene: {current_token_count} tokens "
             f"(available: {available_tokens})"
         )
-        
+
         # Stage 2: Semantic Compression with LLMLingua
-        if ENABLE_SEMANTIC_COMPRESSION and self.compressor:
-            messages = self._apply_semantic_compression(messages, SEMANTIC_COMPRESSION_RATIO)
+        if cfg.enable_semantic_compression and self.compressor:
+            messages = self._apply_semantic_compression(messages, cfg.semantic_compression_ratio)
             current_token_count = self.count_message_tokens(messages)
             logger.debug(f"After semantic compression: {current_token_count} tokens")
-        
+
         # Stage 3: Prompt Caching (add cache control metadata)
-        if ENABLE_PROMPT_CACHING:
+        if cfg.enable_prompt_caching:
             messages = self._add_prompt_caching(messages)
-        
+
         # Stage 4: Importance Scoring (Caveman-inspired)
-        if ENABLE_IMPORTANCE_SCORING:
-            messages = self._filter_by_importance(messages, MIN_MESSAGE_IMPORTANCE)
+        if cfg.enable_importance_scoring:
+            messages = self._filter_by_importance(messages, cfg.min_message_importance)
             current_token_count = self.count_message_tokens(messages)
             logger.debug(f"After importance filtering: {current_token_count} tokens")
-        
+
         # Stage 5: Recursive Summarization
-        if ENABLE_RECURSIVE_SUMMARIZATION and current_token_count > available_tokens * COMPRESSION_THRESHOLD:
+        if cfg.enable_recursive_summarization and current_token_count > available_tokens * cfg.compression_threshold:
             messages = self._recursive_summarization(messages, available_tokens)
             current_token_count = self.count_message_tokens(messages)
             logger.debug(f"After summarization: {current_token_count} tokens")
-        
+
         # Stage 6: Smart Truncation (fallback)
-        if current_token_count > available_tokens * COMPRESSION_THRESHOLD:
+        if current_token_count > available_tokens * cfg.compression_threshold:
             logger.warning(
                 f"Context at {current_token_count/available_tokens:.1%} capacity. "
                 f"Applying truncation..."
             )
             messages = self._truncate_messages(messages, available_tokens)
-        
+
         # POST-OPTIMIZATION VERIFICATION: Prevent double-counting trap
         final_token_count = self.count_message_tokens(messages)
         if final_token_count > available_tokens:
@@ -557,24 +618,26 @@ class TokenOptimizer:
             )
             messages = self._aggressive_truncate(messages, available_tokens)
             final_token_count = self.count_message_tokens(messages)
-        
+
         savings = original_token_count - final_token_count
         savings_pct = (savings / original_token_count * 100) if original_token_count > 0 else 0
-        
+
         if savings > 0:
             logger.info(
                 f"Token optimization saved {savings:,} tokens ({savings_pct:.1f}% reduction). "
                 f"Final count: {final_token_count:,} / {available_tokens:,}"
             )
-        
-        payload["messages"] = messages
-        payload["max_tokens"] = max(
-            1,
-            min(
-                payload.get("max_tokens", RESERVED_RESPONSE_TOKENS),
-                MAX_CONTEXT_TOKENS - final_token_count
-            )
-        )
+
+        requested_max = payload.get("max_tokens", cfg.reserved_response_tokens)
+        clamped_max = max(1, min(requested_max, cfg.max_context_tokens - final_token_count))
+        if clamped_max != requested_max:
+            logger.info(f"Clamped max_tokens {requested_max} -> {clamped_max} to fit the context budget")
+
+        result = {
+            **payload,
+            "messages": messages,
+            "max_tokens": clamped_max,
+        }
 
         # Cache the result (client-specific fields like max_tokens are
         # intentionally excluded so cache hits never override request values)
@@ -583,8 +646,8 @@ class TokenOptimizer:
             "tokens_saved": savings
         }
         self._cache_result(content_hash, cache_data)
-        
-        return payload
+
+        return result
     
     def _remove_duplicates(self, messages: list) -> list:
         """Remove consecutive duplicate messages."""
@@ -913,7 +976,8 @@ class TokenOptimizer:
 
 
 # Initialize token optimizer
-token_optimizer = TokenOptimizer(model_name=DEFAULT_MODEL)
+OPTIMIZATION_CONFIG = OptimizationConfig.from_env()
+token_optimizer = TokenOptimizer(config=OPTIMIZATION_CONFIG, model_name=DEFAULT_MODEL)
 
 
 @app.route('/v1/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
@@ -931,7 +995,7 @@ def dynamic_failover_proxy(path):
     method = request.method
     cookies = request.cookies
 
-    # Parse JSON payload for token optimization (if applicable)
+    # Parse JSON payload (if applicable)
     parsed_payload = None
     is_streaming = False
     if payload and request.is_json:
@@ -942,14 +1006,19 @@ def dynamic_failover_proxy(path):
             if isinstance(parsed_payload, dict):
                 is_streaming = bool(parsed_payload.get("stream", False))
 
-            # Apply token optimization for chat completions
-            if isinstance(parsed_payload, dict) and path.endswith("chat/completions") and ENABLE_CONTEXT_COMPRESSION:
-                logger.info(f"Applying token optimization to request... (streaming={is_streaming})")
-                parsed_payload = token_optimizer.optimize_context(parsed_payload, is_streaming=is_streaming)
-                payload = json.dumps(parsed_payload).encode('utf-8')
-
         except Exception as e:
-            logger.warning(f"Could not parse/optimize payload: {e}")
+            logger.warning(f"Could not parse JSON payload: {e}")
+            parsed_payload = None
+
+    # Optimization owns routing and enabling; identity change tells us
+    # whether anything was rewritten.
+    if isinstance(parsed_payload, dict):
+        optimized = token_optimizer.optimize_context(
+            parsed_payload, path=path, is_streaming=is_streaming
+        )
+        if optimized is not parsed_payload:
+            parsed_payload = optimized
+            payload = json.dumps(parsed_payload).encode('utf-8')
 
     # Legacy clients may signal streaming via query param instead of body.
     # Normalize the upstream body so providers actually stream back.
@@ -1022,9 +1091,9 @@ def health_check():
         "nodes_available": sum(1 for e in nodes if e["cooldown_seconds"] <= 0),
         "current_node_index": node_selector.current_index,
         "nodes": nodes,
-        "token_optimization_enabled": ENABLE_CONTEXT_COMPRESSION,
-        "max_context_tokens": MAX_CONTEXT_TOKENS,
-        "reserved_response_tokens": RESERVED_RESPONSE_TOKENS
+        "token_optimization_enabled": OPTIMIZATION_CONFIG.enabled,
+        "max_context_tokens": OPTIMIZATION_CONFIG.max_context_tokens,
+        "reserved_response_tokens": OPTIMIZATION_CONFIG.reserved_response_tokens
     }), 200
 
 
@@ -1071,9 +1140,9 @@ if __name__ == '__main__':
     logger.info("=" * 70)
     logger.info(f"Binding to: {BIND_HOST}:{BIND_PORT}")
     logger.info(f"Target Provider: {TARGET_PROVIDER_URL}")
-    logger.info(f"Token Optimization: {'ENABLED' if ENABLE_CONTEXT_COMPRESSION else 'DISABLED'}")
-    logger.info(f"Max Context Tokens: {MAX_CONTEXT_TOKENS:,}")
-    logger.info(f"Reserved Response Tokens: {RESERVED_RESPONSE_TOKENS:,}")
+    logger.info(f"Token Optimization: {'ENABLED' if OPTIMIZATION_CONFIG.enabled else 'DISABLED'}")
+    logger.info(f"Max Context Tokens: {OPTIMIZATION_CONFIG.max_context_tokens:,}")
+    logger.info(f"Reserved Response Tokens: {OPTIMIZATION_CONFIG.reserved_response_tokens:,}")
     logger.info(f"Active Nodes: {len(NODE_POOL)}")
     logger.info("=" * 70)
     

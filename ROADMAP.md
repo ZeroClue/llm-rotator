@@ -127,12 +127,17 @@ subprocess-per-assertion for LOG_LEVEL). From the 2026-08-21 architecture review
 LOG_LEVEL testable in-process; conftest env-juggling removed; changing
 `PROXY_BIND_PORT` in `.env` yields a healthy container.
 
-### 16. Deepen compression pipeline contract — `todo`
+### 16. Deepen compression pipeline contract — `done` (2026-08-22)
 Make optimization pure payload-in/payload-out, owning its own routing
-(chat/completions check) and enabling (single gate); one config value object built
-in one place replaces ~15 module-global reads (including `ENABLE_PROMPT_CACHING`
+(chat/completions check) and enabling (single gate); one config value object
+built in one place replaces ~15 module-global reads (including `ENABLE_PROMPT_CACHING`
 computed twice at :106/:146); a no-op adapter covers the disabled case; an explicit
 error mode replaces the caller's blanket except. Relates to item 7 (cache design).
+Amendment: landed as frozen `OptimizationConfig.from_env()` (profile + env folded
+once) + `optimize_context(payload, *, path, is_streaming)` with copy-on-write
+purity and an optimizer-owned never-break-proxying degradation policy; stage tests
+now drive the public interface (`tests/test_optimization.py`). Design record:
+issue #17 comment, 2026-08-22.
 *Rationale:* newest code (fa69cac/7df096e) concentrates the smear: caller owns
 routing + flag pre-check, payload mutated in place AND returned, `max_tokens`
 rewritten silently, cross-request cache invisible to callers; six riskiest stages
