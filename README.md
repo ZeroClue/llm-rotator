@@ -9,6 +9,30 @@ cooldowns, plus an optional token-compression pipeline for `/v1/chat/completions
 > code layout, gotchas, testing, and deployment quirks. This README is the
 > human-facing overview; if the two disagree, trust `rotator.py`/`failover.py`.
 
+## Quick start (Docker)
+
+```bash
+git clone https://github.com/ZeroClue/llm-rotator && cd llm-rotator
+cp .env.example .env
+# Edit .env: set LLM_PROVIDER_URL, then at least one node pair:
+#   PROXY_1_URL=socks5h://100.64.0.1:1055
+#   API_KEY_1=sk-proj-...
+# (remove the PROXY_2..4 / API_KEY_2..4 lines you don't have)
+
+docker compose up -d --build
+curl http://127.0.0.1:8080/health | jq
+```
+
+Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. Done.
+
+The container runs gunicorn with `network_mode: host` (Tailscale's 100.64.x.x
+egresses aren't reachable through bridge networking) and binds loopback —
+nothing is exposed beyond your machine. Watch it work:
+`docker compose logs -f llm-rotator`.
+
+Port 8080 already taken on the host? Set `PROXY_BIND_PORT=<port>` in `.env` —
+the compose healthcheck follows it.
+
 ## How it works
 
 - **Nodes** — each entry in your node pool pairs one egress (a Tailscale SOCKS5
