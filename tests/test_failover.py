@@ -5,6 +5,8 @@ recording sleeper and stubbed rng make retry pacing deterministic. No
 sockets, no Flask, no real sleeps.
 """
 
+import http.cookiejar
+
 import pytest
 import requests
 
@@ -37,14 +39,13 @@ class FakeSession:
         self.script = list(script)
         self.calls = []
 
-    def request(self, method, url, headers=None, data=None, cookies=None,
+    def request(self, method, url, headers=None, data=None,
                 proxies=None, timeout=None, stream=False):
         self.calls.append({
             "method": method,
             "url": url,
             "headers": dict(headers or {}),
             "data": data,
-            "cookies": cookies,
             "proxies": proxies,
             "timeout": timeout,
             "stream": stream,
@@ -229,19 +230,21 @@ def test_client_cookies_never_reach_the_upstream(rotator):
 
 
 def test_production_session_never_stores_upstream_cookies(rotator):
-    import http.cookiejar
+    """Behavioral: a Set-Cookie fed through a jar running this policy is
+    refused, and the production-built session carries the refusing policy."""
+    import email.message
+    import urllib.request
 
-    cookie = http.cookiejar.Cookie(
-        0, "tracker", "leak", None, False, "up.test", True, False,
-        "/", True, False, None, False, None, None, {},
-    )
-    # The policy itself refuses every cookie...
-    assert failover._NoStoreCookiePolicy().set_ok(cookie, None) is False
+    msg = email.message.Message()
+    msg["Set-Cookie"] = "tracker=leak; Path=/"
+    response = type("_R", (), {"info": lambda self: msg})()
 
-    # ...and the production-built session is wired with it (fake sessions are
-    # injected untouched).
+    jar = http.cookiejar.CookieJar(policy=failover._NoStoreCookiePolicy())
+    jar.extract_cookies(response, urllib.request.Request("http://up.test/"))
+    assert list(jar) == []
+
     t, *_ , session = make_transport(rotator, [], use_real_session=True)
-    assert isinstance(session.cookies._policy, failover._NoStoreCookiePolicy)
+    assert isinstance(session.cookies.get_policy(), failover._NoStoreCookiePolicy)
 
 
 def test_compute_backoff_bounds(rotator):
