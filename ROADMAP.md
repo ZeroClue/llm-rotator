@@ -220,6 +220,17 @@ Weighted nodes (capacity-based), per-node rate budgets, mid-stream failover is
 impossible by design (document it); consider `max_completion_tokens` passthrough
 for newer OpenAI models alongside legacy `max_tokens`.
 
+### 18. Dashboard / configuration UI — `todo`
+A web UI for operating a running proxy: visualize node health and lifetime
+counters (`/health` + `/metrics`), browse requests via their correlation IDs,
+and surface — eventually manage — the env-derived configuration safely.
+*Rationale:* the observability data exists (item 9) but is scrape-only;
+operating multi-node pools today means curl + grep. Maintainer wants a proper
+dashboard before any 1.0 claim (2026-08-22).
+*Note:* deliberately un-specced — grill and/or wayfinder before building.
+Spans UI plus likely a read-back config API, so expect decomposition into a
+map with child tickets rather than one item.
+
 ---
 
 ## Repo hygiene quick-wins
