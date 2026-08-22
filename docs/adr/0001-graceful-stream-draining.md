@@ -24,10 +24,18 @@ proxy with a well-formed terminal SSE event (OpenAI-style error object +
 
 - The drain check runs between chunks: an upstream stalled mid-read still
   hits gunicorn's hard kill; the window accelerates clean termination but
-  cannot preempt a blocked socket read.
+  cannot preempt a blocked socket read. The dev-server watchdog likewise
+  grants a short settle beat after the window elapses so guards can flush
+  the terminal event before exit — a very slow upstream gap can still lose
+  that race.
 - The guard lives in the view layer (rotator.py), not failover.py: the
   transport knows nothing about SSE framing.
 - One global deadline is fixed at arm time; streams starting after arming get
   the terminal event immediately.
+- Arming uses chained SIGTERM/SIGINT handlers installed in `create_app()`:
+  gunicorn 26.1.0 never fires its `worker_int` hook on SIGTERM (verified in
+  the pinned source; only SIGINT/SIGQUIT reach it), and `init_signals` runs
+  before app load, so handlers installed by the factory are the ones that
+  survive.
 
 Design record: issue #30 (grill session 2026-08-22).

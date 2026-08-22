@@ -142,6 +142,7 @@ index and silently drops later nodes.
 | `NODE_COOLDOWN_BASE` | `2.0` | First-failure cooldown (seconds); doubles per consecutive failure |
 | `NODE_COOLDOWN_MAX` | `60.0` | Cooldown cap (seconds) |
 | `RETRY_POSTS` | `true` | `false` gives POSTs exactly one attempt — a 504/timeout may mean the upstream completed, so verbatim retries can double-bill |
+| `STREAM_DRAIN_WINDOW` | `20.0` | Graceful-shutdown drain window (seconds from SIGTERM) for in-flight SSE streams: they finish naturally inside it, otherwise they end with a terminal `proxy_shutdown` error event + `[DONE]`. Keep below `GUNICORN_GRACEFUL_TIMEOUT`; `0` cuts on the next chunk |
 | `DEFAULT_MODEL` | `gpt-4o` | Model used for token counting |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `PROXY_AUTH_TOKEN` | *(empty)* | Optional bearer gate: when set, `/v1/*` requires `Authorization: Bearer <token>` (401 otherwise). `/health` and `/ready` stay open |

@@ -9,6 +9,9 @@ class MockUpstream:
 
     def __init__(self, chunk_delay=0.15, bind_host="127.0.0.1"):
         self.chunk_delay = chunk_delay
+        # Number of SSE chunks per streamed completion; tests stretch this
+        # to keep a stream alive past a shutdown drain window.
+        self.sse_parts = 5
         self.script = []
         self._requests = []
         self._lock = threading.Lock()
@@ -106,7 +109,7 @@ class MockUpstream:
         handler.send_header("Connection", "close")
         handler.send_header("Server", "MockUpstream/1.0")
         handler.end_headers()
-        for i in range(5):
+        for i in range(self.sse_parts):
             chunk = {
                 "id": "c1",
                 "object": "chat.completion.chunk",

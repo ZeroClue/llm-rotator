@@ -231,6 +231,28 @@ class TestInstallShutdownHandlers:
         spy.handlers[signal.SIGINT](signal.SIGINT, None)
         assert exits == [0]
 
+    def test_window_elapsed_with_inflight_gives_guards_a_settle_beat(self):
+        """Draining flips while a stream is still open: the watchdog must not
+        exit before a guard observes it between chunks and flushes the
+        terminal event."""
+        spy = SignalSpy()
+        exits = []
+        sleeps = []
+        clock = FakeClock(now=100.0)
+        state = ShutdownState(clock=clock)
+
+        def sleeper(seconds):
+            sleeps.append(seconds)
+
+        from rotator import install_shutdown_handlers
+        make_installer(spy)(state, 0.0,  # draining immediately
+                            exit_fn=lambda code: exits.append(code),
+                            sleeper=sleeper)
+        state.stream_started()
+        spy.handlers[signal.SIGTERM](signal.SIGTERM, None)
+        assert exits == [0]
+        assert 0.25 in sleeps
+
     def test_install_is_idempotent(self):
         spy = SignalSpy()
         installer = make_installer(spy)

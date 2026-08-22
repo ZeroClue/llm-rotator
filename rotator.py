@@ -1098,6 +1098,11 @@ def _drain_and_exit(state, exit_fn, sleeper):
     )
     while not state.draining() and state.inflight > 0:
         sleeper(0.05)
+    if state.inflight > 0:
+        # Window elapsed mid-drain: guards only observe draining() between
+        # chunks, so give them one settle beat to flush the terminal event
+        # before the process goes away.
+        sleeper(0.25)
     exit_fn(0)
 
 
