@@ -177,31 +177,6 @@ def test_retry_after_header_is_honored(mock, client):
     assert len(mock.chat_posts()) >= 2
 
 
-def test_compute_backoff_bounds(rotator, monkeypatch):
-    monkeypatch.setattr(rotator, "RETRY_BACKOFF_BASE", 0.5)
-    monkeypatch.setattr(rotator, "RETRY_BACKOFF_MAX", 8.0)
-    ra = rotator.compute_backoff(0, 2.0)
-    assert ra == 2.0
-    assert rotator.compute_backoff(0, 100.0) == 8.0
-    for attempt in range(6):
-        d = rotator.compute_backoff(attempt, None)
-        assert 0.5 <= d <= 8.0
-    assert rotator.compute_backoff(3, None) >= rotator.compute_backoff(0, None)
-
-
-def test_compute_backoff_jitter_is_injectable(rotator, monkeypatch):
-    monkeypatch.setattr(rotator, "RETRY_BACKOFF_BASE", 0.5)
-    monkeypatch.setattr(rotator, "RETRY_BACKOFF_MAX", 8.0)
-
-    def stub(lo, hi):
-        return hi / 4  # deterministic quarter of the jitter band
-
-    assert rotator.compute_backoff(0, None, rng=stub) == 0.625  # 0.5·2⁰ + 0.125
-    assert rotator.compute_backoff(1, None, rng=stub) == 1.125  # 0.5·2¹ + 0.125
-    assert rotator.compute_backoff(5, None, rng=stub) == 8.0  # capped
-    assert rotator.compute_backoff(0, 2.0, rng=stub) == 2.0  # Retry-After ignores jitter
-
-
 def make_nodes(rotator, count=2):
     return [
         rotator.Node(node_id=i, proxy=f"p{i}", api_key=f"k{i}")
@@ -363,6 +338,15 @@ def test_auth_disabled_by_default(rotator, monkeypatch, client):
 def test_models_endpoint_requires_token_too(rotator, monkeypatch, client):
     monkeypatch.setattr(rotator, "PROXY_AUTH_TOKEN", "sekrit")
     assert client.get("/v1/models").status_code == 401
+
+
+def test_models_endpoint_fails_over_to_healthy_node(mock, client):
+    resp = client.get("/v1/models")
+    assert resp.status_code == 200
+    assert resp.get_json()["data"][0]["id"] == "gpt-4o"
+    gets = [r for r in mock.captured() if r["method"] == "GET"]
+    assert gets and gets[-1]["path"].endswith("/models")
+    assert gets[-1]["auth"] == "Bearer node-two-key"
 
 
 def test_health_reports_available_node_count(client):

@@ -36,6 +36,13 @@ The pool position where the next selection starts scanning for a usable node.
 Retrying a failed request (429/5xx/timeout/connection error) on the next
 usable node instead of returning the error to the client.
 
+**Transport**:
+The framework-agnostic machinery that carries one client request through
+nodes under the failover rule — selection, key injection, egress wiring,
+status classification, retry pacing — and hands back either an upstream
+response or exhaustion. Knows nothing about HTTP frameworks or prompt
+contents.
+
 **Cooldown**:
 The period after a node failure during which rotation skips that node;
 grows exponentially with consecutive failures up to a cap.

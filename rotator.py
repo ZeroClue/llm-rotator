@@ -20,14 +20,16 @@ import re
 import hmac
 import json
 import time
-import random
 import logging
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
+
 from flask import Flask, request, Response, jsonify, stream_with_context
 from werkzeug.exceptions import HTTPException
+
+from failover import AllNodesFailed, FailoverTransport
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(
@@ -53,10 +55,6 @@ except ImportError:
     LLMLINGUA_AVAILABLE = False
     logger.warning("llmlingua not installed. Advanced semantic compression disabled. Install with: pip install llmlingua")
 
-import requests
-from requests import Session
-from requests.exceptions import RequestException, Timeout, ConnectionError
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration via Environment Variables
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,29 +67,6 @@ RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "0.5"))
 RETRY_BACKOFF_MAX = float(os.getenv("RETRY_BACKOFF_MAX", "8.0"))
 NODE_COOLDOWN_BASE = float(os.getenv("NODE_COOLDOWN_BASE", "2.0"))
 NODE_COOLDOWN_MAX = float(os.getenv("NODE_COOLDOWN_MAX", "60.0"))
-
-_HOP_BY_HOP_HEADERS = frozenset({
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailer", "trailers", "transfer-encoding", "upgrade",
-    "date", "server", "content-encoding", "content-length",
-})
-
-
-def parse_retry_after(value):
-    if not value:
-        return None
-    try:
-        seconds = float(value)
-    except ValueError:
-        return None
-    return seconds if seconds >= 0 else None
-
-
-def compute_backoff(attempt, retry_after=None, rng=random.uniform):
-    if retry_after is not None:
-        return min(retry_after, RETRY_BACKOFF_MAX)
-    delay = RETRY_BACKOFF_BASE * (2 ** attempt) + rng(0, RETRY_BACKOFF_BASE)
-    return min(delay, RETRY_BACKOFF_MAX)
 
 # Token optimization settings
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "120000"))  # Reserve tokens for response
@@ -189,9 +164,8 @@ except Exception as e:
     raise SystemExit(1)
 
 
-# Initialize Flask app and session
+# Initialize Flask app; the upstream HTTP session lives inside the transport.
 app = Flask(__name__)
-session = Session()
 
 # Optional bearer-token gate. Empty disables auth entirely (current behavior
 # for existing deployments). /health and /ready stay open either way so
@@ -356,6 +330,17 @@ def node_health_snapshot(nodes, ledger, now=None):
 _ledger_lock = threading.RLock()
 health_ledger = HealthLedger(NODE_POOL, NODE_COOLDOWN_BASE, NODE_COOLDOWN_MAX, lock=_ledger_lock)
 node_selector = NodeSelector(NODE_POOL, health_ledger, lock=_ledger_lock)
+
+# Retry/failover transport: env read once here; session/sleeper/rng default
+# to production adapters inside the module.
+transport = FailoverTransport(
+    selector=node_selector,
+    ledger=health_ledger,
+    max_retries=MAX_RETRIES,
+    timeout=REQUEST_TIMEOUT,
+    backoff_base=RETRY_BACKOFF_BASE,
+    backoff_max=RETRY_BACKOFF_MAX,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -974,123 +959,51 @@ def dynamic_failover_proxy(path):
         parsed_payload["stream"] = True
         payload = json.dumps(parsed_payload).encode('utf-8')
 
-    # Filter incoming host headers to prevent proxy conflicts
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in ('host', 'content-length')}
-
     # Construct the full target URL
     url = f"{TARGET_PROVIDER_URL}/{path}"
-    last_error = None
 
-    for attempt in range(MAX_RETRIES):
-        node = node_selector.select()
+    result = transport.send(
+        method=method,
+        url=url,
+        headers=dict(request.headers),
+        payload=payload,
+        cookies=cookies,
+        stream=stream_upstream,
+    )
 
-        # Inject target node's API key
-        headers["Authorization"] = f"Bearer {node.api_key}"
-
-        # Configure SOCKS5H proxy (ensures DNS resolution happens on remote node)
-        proxies = {
-            "http": node.proxy,
-            "https": node.proxy
-        }
-
-        logger.info(
-            f"Attempt {attempt + 1}/{MAX_RETRIES}: Routing via Node {node.node_id} "
-            f"({node.proxy.split('://')[1].split(':')[0]})"
+    if isinstance(result, AllNodesFailed):
+        logger.critical(f"All {MAX_RETRIES} proxy nodes failed. Last error: {result.last_error}")
+        return Response(
+            json.dumps({
+                "error": {
+                    "message": "Proxy Gateway Error: All backend nodes exhausted or rate-limited",
+                    "type": "gateway_error",
+                    "last_error": result.last_error
+                }
+            }),
+            502,
+            {"Content-Type": "application/json"}
         )
 
-        retry_after = None
+    if stream_upstream:
+        return Response(result.body(), result.status_code, result.header_pairs)
+
+    body = result.body()
+    # Log token usage only for buffered JSON bodies; streamed SSE responses
+    # returned above never buffer here.
+    if result.status_code == 200 and parsed_payload and isinstance(body, bytes):
         try:
-            response = session.request(
-                method=method,
-                url=url,
-                headers=headers,
-                data=payload,
-                cookies=cookies,
-                proxies=proxies,
-                timeout=REQUEST_TIMEOUT,
-                stream=stream_upstream
-            )
-
-            # Trigger failover on rate limits or server errors
-            if response.status_code in [429, 500, 502, 503, 504]:
-                logger.warning(
-                    f"Node {node.node_id} returned HTTP {response.status_code}. "
-                    f"Retrying with next node..."
+            usage = json.loads(body).get("usage", {})
+            if usage:
+                logger.info(
+                    f"Token usage - Prompt: {usage.get('prompt_tokens', 'N/A')}, "
+                    f"Completion: {usage.get('completion_tokens', 'N/A')}, "
+                    f"Total: {usage.get('total_tokens', 'N/A')}"
                 )
-                last_error = f"Upstream error: {response.status_code}"
-                retry_after = parse_retry_after(response.headers.get("Retry-After"))
-                response.close()
-                health_ledger.record_failure(node)
-                continue
+        except Exception:
+            pass
 
-            health_ledger.record_success(node)
-
-            # Log token usage only for buffered JSON bodies; calling .json()
-            # on a streamed SSE response would consume the whole stream.
-            if response.status_code == 200 and parsed_payload and not stream_upstream:
-                try:
-                    resp_json = response.json()
-                    usage = resp_json.get("usage", {})
-                    if usage:
-                        logger.info(
-                            f"Token usage - Prompt: {usage.get('prompt_tokens', 'N/A')}, "
-                            f"Completion: {usage.get('completion_tokens', 'N/A')}, "
-                            f"Total: {usage.get('total_tokens', 'N/A')}"
-                        )
-                except Exception:
-                    pass
-
-            # Strip hop-by-hop and framing headers; requests has already
-            # decoded content-encoding and werkzeug owns connection framing.
-            forward_headers = [
-                (k, v) for k, v in response.headers.items()
-                if k.lower() not in _HOP_BY_HOP_HEADERS
-            ]
-
-            if stream_upstream:
-                def generate():
-                    try:
-                        # chunk_size=1: larger sizes do exact blocking reads and
-                        # buffer small SSE events until EOF, killing latency.
-                        for chunk in response.iter_content(chunk_size=1):
-                            yield chunk
-                    finally:
-                        response.close()
-                return Response(generate(), response.status_code, forward_headers)
-
-            body = response.content
-            response.close()
-            return Response(body, response.status_code, forward_headers)
-
-        except Timeout as e:
-            logger.error(f"Timeout on Node {node.node_id}: {str(e)}. Retrying...")
-            last_error = f"Timeout: {str(e)}"
-            health_ledger.record_failure(node)
-        except ConnectionError as e:
-            logger.error(f"Connection error on Node {node.node_id}: {str(e)}. Retrying...")
-            last_error = f"Connection error: {str(e)}"
-            health_ledger.record_failure(node)
-        except RequestException as e:
-            logger.error(f"Request failed on Node {node.node_id}: {str(e)}. Retrying...")
-            last_error = f"Request error: {str(e)}"
-            health_ledger.record_failure(node)
-
-        if attempt < MAX_RETRIES - 1:
-            time.sleep(compute_backoff(attempt, retry_after))
-
-    # All retries exhausted
-    logger.critical(f"All {MAX_RETRIES} proxy nodes failed. Last error: {last_error}")
-    return Response(
-        json.dumps({
-            "error": {
-                "message": "Proxy Gateway Error: All backend nodes exhausted or rate-limited",
-                "type": "gateway_error",
-                "last_error": last_error
-            }
-        }),
-        502,
-        {"Content-Type": "application/json"}
-    )
+    return Response(body, result.status_code, result.header_pairs)
 
 
 def nodes_available_count():
@@ -1126,22 +1039,16 @@ def ready_check():
 
 @app.route('/v1/models', methods=['GET'])
 def list_models():
-    """Proxy model listing endpoint."""
-    node = node_selector.select()
-    headers = {"Authorization": f"Bearer {node.api_key}"}
-    proxies = {"http": node.proxy, "https": node.proxy}
-    
-    try:
-        response = session.get(
-            url=f"{TARGET_PROVIDER_URL}/models",
-            headers=headers,
-            proxies=proxies,
-            timeout=10
-        )
-        return Response(response.content, response.status_code, response.headers.items())
-    except RequestException as e:
-        logger.error(f"Failed to fetch models: {e}")
+    """Proxy model listing endpoint (full failover via the transport)."""
+    result = transport.send(
+        method="GET",
+        url=f"{TARGET_PROVIDER_URL}/models",
+        headers={},
+    )
+    if isinstance(result, AllNodesFailed):
+        logger.error(f"Failed to fetch models: {result.last_error}")
         return jsonify({"error": "Failed to fetch models from upstream"}), 502
+    return Response(result.body(), result.status_code, result.header_pairs)
 
 
 @app.errorhandler(Exception)
