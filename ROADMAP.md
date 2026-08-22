@@ -99,10 +99,14 @@ tenant scale ever appears, reintroduce behind a measured hit-rate design.
 *Acceptance:* measured hit-rate improvement on a simulated growing conversation, or
 feature removed with its config flags deprecated.
 
-### 8. README rewrite — `todo`
+### 8. README rewrite — `done` (2026-08-22)
 README still documents ~10 nonexistent env vars, `/health/detailed`, wrong bind var
 names, Python 3.8+ support. Rewrite against actual code; keep AGENTS.md as the
 agent-facing source of truth and link both.
+Amendment: rewritten from a grep-verified inventory — env-var tables now match
+rotator.py/gunicorn.conf.py exactly (including RETRY_POSTS/PROXY_AUTH_TOKEN/
+GUNICORN_*), endpoints include /ready, /health example is the real JSON shape,
+Python 3.10+. Acceptance run mechanically: zero fake vars/endpoints.
 *Acceptance:* every env var/endpoint in README greps clean against `rotator.py`.
 
 ### 14. Extract failover transport from the proxy view — `done` (2026-08-22)
