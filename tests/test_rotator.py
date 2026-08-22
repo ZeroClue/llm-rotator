@@ -42,7 +42,7 @@ def test_health_never_leaks_api_keys(client, rotator):
     text = resp.get_data(as_text=True)
     assert "api_key" not in text.lower().replace("api_keys_configured", "")
     for node in rotator.NODE_POOL:
-        assert node["api_key"] not in text
+        assert node.api_key not in text
 
 
 def test_default_config_does_not_inject_cache_control(client, chat_captures):
@@ -202,69 +202,103 @@ def test_compute_backoff_jitter_is_injectable(rotator, monkeypatch):
     assert rotator.compute_backoff(0, 2.0, rng=stub) == 2.0  # Retry-After ignores jitter
 
 
-def test_cooldown_skips_recently_failed_node(rotator, monkeypatch):
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_BASE", 30)
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_MAX", 300)
-    clock = FakeClock(start=100.0)
+def make_nodes(rotator, count=2):
+    return [
+        rotator.Node(node_id=i, proxy=f"p{i}", api_key=f"k{i}")
+        for i in range(1, count + 1)
+    ]
 
-    it = rotator.ThreadSafeIterator([
-        {"proxy": "p1", "api_key": "k1", "node_id": 1},
-        {"proxy": "p2", "api_key": "k2", "node_id": 2},
-    ])
-    first = it.get_next(now=clock.now)
-    assert first["node_id"] == 1
-    it.report_failure(first, now=clock.now)
-    assert [it.get_next(now=clock.now)["node_id"] for _ in range(3)] == [2, 2, 2]
+
+def test_node_rejects_unknown_fields(rotator):
+    with pytest.raises(TypeError):
+        rotator.Node(node_id=1, proxy="p", api_key="k", typo="x")
+
+
+def test_node_repr_hides_api_key(rotator):
+    node = rotator.Node(node_id=1, proxy="p", api_key="sekrit")
+    assert "sekrit" not in repr(node)
+
+
+def make_selector(rotator, cooldown_base=30.0, cooldown_max=300.0):
+    nodes = make_nodes(rotator)
+    ledger = rotator.HealthLedger(nodes, cooldown_base, cooldown_max)
+    return rotator.NodeSelector(nodes, ledger), ledger
+
+
+def test_ledger_rejects_out_of_pool_nodes(rotator):
+    _, ledger = make_selector(rotator)
+    stranger = rotator.Node(node_id=99, proxy="px", api_key="kx")
+    with pytest.raises(ValueError):
+        ledger.record_failure(stranger)
+    with pytest.raises(ValueError):
+        ledger.record_success(stranger)
+    with pytest.raises(ValueError):
+        ledger.usable(stranger)
+
+
+def test_cooldown_skips_recently_failed_node(rotator):
+    clock = FakeClock(start=100.0)
+    selector, ledger = make_selector(rotator)
+
+    first = selector.select(now=clock.now)
+    assert first.node_id == 1
+    ledger.record_failure(first, now=clock.now)
+    assert [selector.select(now=clock.now).node_id for _ in range(3)] == [2, 2, 2]
     clock.advance(29)  # cooldown deadline is t=130; still cooling at t=129
-    assert it.get_next(now=clock.now)["node_id"] == 2
+    assert selector.select(now=clock.now).node_id == 2
     clock.advance(2)  # t=131, past the deadline
-    assert it.get_next(now=clock.now)["node_id"] == 1
+    assert selector.select(now=clock.now).node_id == 1
 
 
-def test_never_starves_when_all_nodes_are_cooling(rotator, monkeypatch):
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_BASE", 30)
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_MAX", 300)
+def test_never_starves_when_all_nodes_are_cooling(rotator):
     clock = FakeClock(start=100.0)
+    selector, ledger = make_selector(rotator)
 
-    it = rotator.ThreadSafeIterator([
-        {"proxy": "p1", "api_key": "k1", "node_id": 1},
-        {"proxy": "p2", "api_key": "k2", "node_id": 2},
-    ])
-    node1 = it.get_next(now=clock.now)
-    it.report_failure(node1, now=clock.now)
-    node2 = it.get_next(now=clock.now)
-    it.report_failure(node2, now=clock.now)
+    node1 = selector.select(now=clock.now)
+    ledger.record_failure(node1, now=clock.now)
+    node2 = selector.select(now=clock.now)
+    ledger.record_failure(node2, now=clock.now)
     # Both nodes cooling: the never-starve rule serves the cursor node anyway.
-    assert [it.get_next(now=clock.now)["node_id"] for _ in range(2)] == [1, 2]
+    assert [selector.select(now=clock.now).node_id for _ in range(2)] == [1, 2]
 
 
-def test_report_success_clears_cooldown(rotator, monkeypatch):
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_BASE", 60)
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_MAX", 60)
-    it = rotator.ThreadSafeIterator([
-        {"proxy": "p1", "api_key": "k1", "node_id": 1},
-        {"proxy": "p2", "api_key": "k2", "node_id": 2},
-    ])
-    node = it.get_next()
-    it.report_failure(node)
-    assert it.get_next()["node_id"] == 2
-    it.report_success(node)
-    assert it.get_next()["node_id"] == 1
+def test_record_success_clears_cooldown(rotator):
+    selector, ledger = make_selector(rotator, cooldown_base=60.0, cooldown_max=60.0)
+
+    node = selector.select()
+    ledger.record_failure(node)
+    assert selector.select().node_id == 2
+    ledger.record_success(node)
+    assert selector.select().node_id == 1
 
 
-def test_snapshot_reports_remaining_cooldown(rotator, monkeypatch):
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_BASE", 30)
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_MAX", 300)
+def test_cooldown_doubles_and_caps_through_public_interface(rotator):
+    clock = FakeClock(start=0.0)
+    _, ledger = make_selector(rotator, cooldown_base=2.0, cooldown_max=5.0)
+    node = rotator.Node(node_id=1, proxy="p1", api_key="k1")
+
+    ledger.record_failure(node, now=clock.now)
+    assert ledger.cooldown_remaining(node, now=1.9) == pytest.approx(0.1)  # base: 2s
+    ledger.record_failure(node, now=2.0)
+    assert ledger.cooldown_remaining(node, now=2.0) == pytest.approx(4.0)  # doubled
+    ledger.record_failure(node, now=6.0)
+    assert ledger.cooldown_remaining(node, now=6.0) == 5.0  # capped
+    ledger.record_failure(node, now=11.0)
+    assert ledger.cooldown_remaining(node, now=11.0) == 5.0  # stays capped
+    assert ledger.failure_count(node) == 4
+    ledger.record_success(node)
+    assert ledger.cooldown_remaining(node, now=11.0) == 0.0
+    assert ledger.failure_count(node) == 0
+
+
+def test_snapshot_reports_remaining_cooldown(rotator):
     clock = FakeClock(start=100.0)
+    nodes = make_nodes(rotator)
+    ledger = rotator.HealthLedger(nodes, 30.0, 300.0)
 
-    it = rotator.ThreadSafeIterator([
-        {"proxy": "p1", "api_key": "k1", "node_id": 1},
-        {"proxy": "p2", "api_key": "k2", "node_id": 2},
-    ])
-    node = it.get_next(now=clock.now)
-    it.report_failure(node, now=clock.now)
+    ledger.record_failure(nodes[0], now=clock.now)
     clock.advance(15)
-    snap = {e["node_id"]: e for e in it.snapshot(now=clock.now)}
+    snap = {e["node_id"]: e for e in rotator.node_health_snapshot(nodes, ledger, now=clock.now)}
     assert snap[1]["consecutive_failures"] == 1
     assert snap[1]["cooldown_seconds"] == 15.0  # 30s cooldown, 15s elapsed
     assert snap[2]["cooldown_seconds"] == 0.0
@@ -337,14 +371,10 @@ def test_health_reports_available_node_count(client):
     assert body["nodes_available"] == body["nodes_configured"]
 
 
-def test_ready_flips_503_when_all_nodes_cooling(rotator, monkeypatch, client):
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_BASE", 30)
-    monkeypatch.setattr(rotator, "NODE_COOLDOWN_MAX", 300)
+def test_ready_flips_503_when_all_nodes_cooling(rotator, client):
     assert client.get("/ready").status_code == 200
     for node in rotator.NODE_POOL:
-        rotator.node_iterator.report_failure(
-            {"node_id": node["node_id"], "proxy": node["proxy"], "api_key": node["api_key"]}
-        )
+        rotator.health_ledger.record_failure(node)
     resp = client.get("/ready")
     assert resp.status_code == 503
     assert resp.get_json()["nodes_available"] == 0

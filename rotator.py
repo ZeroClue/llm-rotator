@@ -24,6 +24,7 @@ import random
 import logging
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from functools import lru_cache
 from flask import Flask, request, Response, jsonify, stream_with_context
 from werkzeug.exceptions import HTTPException
@@ -151,34 +152,33 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o")
 # ─────────────────────────────────────────────────────────────────────────────
 # Build Node Pool from Environment Variables
 # ─────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class Node:
+    """One upstream target: an egress paired with the API key spent through it."""
+    node_id: int
+    proxy: str
+    api_key: str = field(repr=False)
+
+
 def build_node_pool():
-    """Build node pool from environment variables."""
+    """Build the ordered node pool from PROXY_N_URL/API_KEY_N pairs."""
     pool = []
     node_index = 1
-    
+
     while True:
         proxy_url = os.getenv(f"PROXY_{node_index}_URL")
         api_key = os.getenv(f"API_KEY_{node_index}")
-        
+
         if not proxy_url or not api_key:
             if node_index == 1:
                 logger.error("At least one node (PROXY_1_URL and API_KEY_1) must be configured!")
                 raise ValueError("Missing required node configuration")
             break
-        
-        pool.append({
-            "proxy": proxy_url,
-            "api_key": api_key,
-            "node_id": node_index,
-            "consecutive_failures": 0,
-            "fail_until": 0.0
-        })
+
+        pool.append(Node(node_id=node_index, proxy=proxy_url, api_key=api_key))
         logger.info(f"Loaded node {node_index}: {proxy_url}")
         node_index += 1
-    
-    if len(pool) < 1:
-        raise ValueError("No nodes configured in environment variables")
-    
+
     logger.info(f"Node pool initialized with {len(pool)} nodes")
     return pool
 
@@ -222,100 +222,140 @@ def require_bearer_token():
     return None
 
 
-class ThreadSafeIterator:
+class HealthLedger:
     """
-    Thread-safe round-robin cursor over the node pool with per-node
-    failure cooldowns. Nodes that recently failed are skipped until their
-    cooldown expires; if every node is cooling down, the cursor node is
-    used anyway so requests never starve.
+    Per-node failure and cooldown accounting. Records consecutive failures,
+    computes exponentially growing cooldowns capped at a maximum, and answers
+    usability queries. Nodes carry no failure state themselves.
     """
 
-    def __init__(self, pool):
-        self.pool = pool
-        self.index = 0
-        self.lock = threading.Lock()
-        for entry in self.pool:
-            entry.setdefault("consecutive_failures", 0)
-            entry.setdefault("fail_until", 0.0)
+    def __init__(self, nodes, cooldown_base, cooldown_max, lock=None):
+        self._cooldown_base = cooldown_base
+        self._cooldown_max = cooldown_max
+        # Reentrant because NodeSelector.select() holds this same shared lock
+        # while calling usable(); separate locks would break that atomicity.
+        self._lock = lock if lock is not None else threading.RLock()
+        self._state = {
+            n.node_id: {"consecutive_failures": 0, "fail_until": 0.0}
+            for n in nodes
+        }
 
-    def get_next(self, now=None):
-        """Atomically select the next usable node and advance the cursor."""
+    def _entry(self, node):
+        entry = self._state.get(node.node_id)
+        if entry is None:
+            raise ValueError(f"Unknown node_id: {node.node_id!r}")
+        return entry
+
+    def usable(self, node, now=None):
+        """True unless the node is inside a cooldown window at time `now`."""
         if now is None:
             now = time.monotonic()
-        with self.lock:
-            n = len(self.pool)
+        with self._lock:
+            return self._entry(node)["fail_until"] <= now
+
+    def cooldown_remaining(self, node, now=None):
+        """Seconds left in the node's cooldown at time `now` (0 when usable)."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            return max(0.0, self._entry(node)["fail_until"] - now)
+
+    def failure_count(self, node):
+        with self._lock:
+            return self._entry(node)["consecutive_failures"]
+
+    def health_state(self, now=None):
+        """All nodes' {consecutive_failures, cooldown_seconds} under one lock
+        and a single clock reading, so a report can't tear the pair apart."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            return {
+                nid: {
+                    "consecutive_failures": e["consecutive_failures"],
+                    "cooldown_seconds": round(max(0.0, e["fail_until"] - now), 3),
+                }
+                for nid, e in self._state.items()
+            }
+
+    def record_success(self, node):
+        with self._lock:
+            entry = self._entry(node)
+            entry["consecutive_failures"] = 0
+            entry["fail_until"] = 0.0
+
+    def record_failure(self, node, now=None):
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            entry = self._entry(node)
+            entry["consecutive_failures"] += 1
+            cooldown = min(
+                self._cooldown_max,
+                self._cooldown_base * (2 ** (entry["consecutive_failures"] - 1)),
+            )
+            entry["fail_until"] = now + cooldown
+
+    def reset_all(self):
+        with self._lock:
+            for entry in self._state.values():
+                entry["consecutive_failures"] = 0
+                entry["fail_until"] = 0.0
+
+
+class NodeSelector:
+    """
+    Round-robin cursor over the node pool. Selects the next usable node and
+    advances the cursor past each selection; if every node is cooling down,
+    serves the cursor node anyway so requests never starve.
+    """
+
+    def __init__(self, nodes, ledger, lock=None):
+        self.nodes = list(nodes)
+        self.ledger = ledger
+        self._index = 0
+        self._lock = lock if lock is not None else threading.RLock()
+
+    @property
+    def current_index(self):
+        with self._lock:
+            return self._index
+
+    def select(self, now=None):
+        """Atomically pick the next usable node and advance the cursor."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            n = len(self.nodes)
             chosen = None
             for offset in range(n):
-                i = (self.index + offset) % n
-                if self.pool[i]["fail_until"] <= now:
+                i = (self._index + offset) % n
+                if self.ledger.usable(self.nodes[i], now):
                     chosen = i
                     break
             if chosen is None:
-                chosen = self.index % n
-            node = self.pool[chosen]
-            self.index = (chosen + 1) % n
-            return {
-                "proxy": node["proxy"],
-                "api_key": node["api_key"],
-                "node_id": node["node_id"],
-            }
-
-    def get_current_index(self):
-        """Get the current node index (for health checks)."""
-        with self.lock:
-            return self.index
-
-    def report_success(self, node):
-        with self.lock:
-            entry = self._find(node)
-            if entry is not None:
-                entry["consecutive_failures"] = 0
-                entry["fail_until"] = 0.0
-
-    def report_failure(self, node, now=None):
-        with self.lock:
-            entry = self._find(node)
-            if entry is None:
-                return
-            entry["consecutive_failures"] += 1
-            cooldown = min(
-                NODE_COOLDOWN_MAX,
-                NODE_COOLDOWN_BASE * (2 ** (entry["consecutive_failures"] - 1)),
-            )
-            if now is None:
-                now = time.monotonic()
-            entry["fail_until"] = now + cooldown
-
-    def clear_failures(self):
-        with self.lock:
-            for entry in self.pool:
-                entry["consecutive_failures"] = 0
-                entry["fail_until"] = 0.0
-
-    def snapshot(self, now=None):
-        """Public view of node state for health checks (never includes keys)."""
-        if now is None:
-            now = time.monotonic()
-        with self.lock:
-            return [{
-                "node_id": e["node_id"],
-                "proxy": e["proxy"],
-                "consecutive_failures": e["consecutive_failures"],
-                "cooldown_seconds": round(max(0.0, e["fail_until"] - now), 3),
-            } for e in self.pool]
-
-    def _find(self, node):
-        target = node.get("node_id") if isinstance(node, dict) else None
-        if target is None:
-            return None
-        for entry in self.pool:
-            if entry["node_id"] == target:
-                return entry
-        return None
+                chosen = self._index % n
+            node = self.nodes[chosen]
+            self._index = (chosen + 1) % n
+            return node
 
 
-# Initialize the thread-safe node iterator
-node_iterator = ThreadSafeIterator(NODE_POOL)
+def node_health_snapshot(nodes, ledger, now=None):
+    """Public per-node view for health checks (never includes keys)."""
+    state = ledger.health_state(now=now)
+    return [{
+        "node_id": n.node_id,
+        "proxy": n.proxy,
+        "consecutive_failures": state[n.node_id]["consecutive_failures"],
+        "cooldown_seconds": state[n.node_id]["cooldown_seconds"],
+    } for n in nodes]
+
+
+# One shared reentrant lock keeps ledger updates atomic with selection,
+# matching the previous single-lock behavior of the combined class.
+_ledger_lock = threading.RLock()
+health_ledger = HealthLedger(NODE_POOL, NODE_COOLDOWN_BASE, NODE_COOLDOWN_MAX, lock=_ledger_lock)
+node_selector = NodeSelector(NODE_POOL, health_ledger, lock=_ledger_lock)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -942,20 +982,20 @@ def dynamic_failover_proxy(path):
     last_error = None
 
     for attempt in range(MAX_RETRIES):
-        node = node_iterator.get_next()
+        node = node_selector.select()
 
         # Inject target node's API key
-        headers["Authorization"] = f"Bearer {node['api_key']}"
+        headers["Authorization"] = f"Bearer {node.api_key}"
 
         # Configure SOCKS5H proxy (ensures DNS resolution happens on remote node)
         proxies = {
-            "http": node["proxy"],
-            "https": node["proxy"]
+            "http": node.proxy,
+            "https": node.proxy
         }
 
         logger.info(
-            f"Attempt {attempt + 1}/{MAX_RETRIES}: Routing via Node {node['node_id']} "
-            f"({node['proxy'].split('://')[1].split(':')[0]})"
+            f"Attempt {attempt + 1}/{MAX_RETRIES}: Routing via Node {node.node_id} "
+            f"({node.proxy.split('://')[1].split(':')[0]})"
         )
 
         retry_after = None
@@ -974,16 +1014,16 @@ def dynamic_failover_proxy(path):
             # Trigger failover on rate limits or server errors
             if response.status_code in [429, 500, 502, 503, 504]:
                 logger.warning(
-                    f"Node {node['node_id']} returned HTTP {response.status_code}. "
+                    f"Node {node.node_id} returned HTTP {response.status_code}. "
                     f"Retrying with next node..."
                 )
                 last_error = f"Upstream error: {response.status_code}"
                 retry_after = parse_retry_after(response.headers.get("Retry-After"))
                 response.close()
-                node_iterator.report_failure(node)
+                health_ledger.record_failure(node)
                 continue
 
-            node_iterator.report_success(node)
+            health_ledger.record_success(node)
 
             # Log token usage only for buffered JSON bodies; calling .json()
             # on a streamed SSE response would consume the whole stream.
@@ -1023,17 +1063,17 @@ def dynamic_failover_proxy(path):
             return Response(body, response.status_code, forward_headers)
 
         except Timeout as e:
-            logger.error(f"Timeout on Node {node['node_id']}: {str(e)}. Retrying...")
+            logger.error(f"Timeout on Node {node.node_id}: {str(e)}. Retrying...")
             last_error = f"Timeout: {str(e)}"
-            node_iterator.report_failure(node)
+            health_ledger.record_failure(node)
         except ConnectionError as e:
-            logger.error(f"Connection error on Node {node['node_id']}: {str(e)}. Retrying...")
+            logger.error(f"Connection error on Node {node.node_id}: {str(e)}. Retrying...")
             last_error = f"Connection error: {str(e)}"
-            node_iterator.report_failure(node)
+            health_ledger.record_failure(node)
         except RequestException as e:
-            logger.error(f"Request failed on Node {node['node_id']}: {str(e)}. Retrying...")
+            logger.error(f"Request failed on Node {node.node_id}: {str(e)}. Retrying...")
             last_error = f"Request error: {str(e)}"
-            node_iterator.report_failure(node)
+            health_ledger.record_failure(node)
 
         if attempt < MAX_RETRIES - 1:
             time.sleep(compute_backoff(attempt, retry_after))
@@ -1054,19 +1094,20 @@ def dynamic_failover_proxy(path):
 
 
 def nodes_available_count():
-    """Nodes not currently in cooldown, per the iterator's own clock."""
-    return sum(1 for e in node_iterator.snapshot() if e["cooldown_seconds"] <= 0)
+    """Nodes not currently in cooldown, per the ledger's own clock."""
+    state = health_ledger.health_state()
+    return sum(1 for e in state.values() if e["cooldown_seconds"] <= 0)
 
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for monitoring."""
-    nodes = node_iterator.snapshot()
+    nodes = node_health_snapshot(NODE_POOL, health_ledger)
     return jsonify({
         "status": "healthy",
         "nodes_configured": len(NODE_POOL),
         "nodes_available": sum(1 for e in nodes if e["cooldown_seconds"] <= 0),
-        "current_node_index": node_iterator.get_current_index(),
+        "current_node_index": node_selector.current_index,
         "nodes": nodes,
         "token_optimization_enabled": ENABLE_CONTEXT_COMPRESSION,
         "max_context_tokens": MAX_CONTEXT_TOKENS,
@@ -1086,9 +1127,9 @@ def ready_check():
 @app.route('/v1/models', methods=['GET'])
 def list_models():
     """Proxy model listing endpoint."""
-    node = node_iterator.get_next()
-    headers = {"Authorization": f"Bearer {node['api_key']}"}
-    proxies = {"http": node["proxy"], "https": node["proxy"]}
+    node = node_selector.select()
+    headers = {"Authorization": f"Bearer {node.api_key}"}
+    proxies = {"http": node.proxy, "https": node.proxy}
     
     try:
         response = session.get(

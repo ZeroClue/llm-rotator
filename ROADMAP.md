@@ -138,9 +138,12 @@ architecture review.
 params instead of monkeypatched module globals; truncation/dedup/importance stages
 tested through the public interface.
 
-### 17. Split round-robin cursor from node-health ledger — `todo`
+### 17. Split round-robin cursor from node-health ledger — `done` (2026-08-22)
 Type nodes (dataclass) and split `ThreadSafeIterator`'s two roles: cursor vs
 failure/cooldown ledger taking time as an argument (pairs with item 13).
+Amendment: landed as frozen `Node` dataclass + `NodeSelector`/`HealthLedger`
+sharing one reentrant lock; ledger raises `ValueError` on out-of-pool nodes
+instead of silently no-oping. Design record: issue #11 comment, 2026-08-22.
 *Rationale:* the node dict shape is established twice (:172–173, :208–210)
 because neither constructor trusts the other; cooldown math/consumption/display/
 reset live in four neighborhoods; `report_failure` silently no-ops when handed a

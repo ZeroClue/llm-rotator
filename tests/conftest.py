@@ -33,12 +33,10 @@ def rotator(mock):
 @pytest.fixture(autouse=True)
 def clean_state(rotator):
     rotator.token_optimizer.context_cache.clear()
-    if hasattr(rotator.node_iterator, "clear_failures"):
-        rotator.node_iterator.clear_failures()
+    rotator.health_ledger.reset_all()
     yield
     rotator.token_optimizer.context_cache.clear()
-    if hasattr(rotator.node_iterator, "clear_failures"):
-        rotator.node_iterator.clear_failures()
+    rotator.health_ledger.reset_all()
 
 
 @pytest.fixture()
