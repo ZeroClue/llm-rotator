@@ -97,16 +97,27 @@ def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
     return transport, ledger, sleeper, nodes, session or transport.session
 
 
-def test_retry_posts_disabled_gives_post_exactly_one_attempt(rotator):
-    r502, rok_a, rok_b = (FakeResponse(status=502), FakeResponse(status=200),
-                          FakeResponse(status=200))
+@pytest.mark.parametrize("mode", [
+    "502",
+    "timeout",
+    "connection_error",
+    "request_exception",
+])
+def test_retry_posts_disabled_gives_post_exactly_one_attempt(rotator, mode):
+    failure = {
+        "502": lambda: FakeResponse(status=502),
+        "timeout": lambda: requests.Timeout("stalled"),
+        "connection_error": lambda: requests.ConnectionError("down"),
+        "request_exception": lambda: requests.RequestException("boom"),
+    }[mode]()
+    rok_a, rok_b = FakeResponse(status=200), FakeResponse(status=200)
     t, ledger, sleeper, nodes, session = make_transport(
-        rotator, [r502, rok_a, rok_b], max_retries=3, retry_posts=False)
+        rotator, [failure, rok_a, rok_b], max_retries=3, retry_posts=False)
 
     result = t.send("POST", "http://up.test/v1/chat/completions", headers={})
 
     assert isinstance(result, failover.AllNodesFailed)
-    assert result.last_error == "Upstream error: 502"
+    assert result.attempts == 1
     assert session.call_count == 1  # no failover attempt
     assert sleeper.sleeps == []     # no pacing
     assert not ledger.usable(nodes[0])  # outcome still recorded
@@ -116,6 +127,16 @@ def test_retry_posts_disabled_gives_post_exactly_one_attempt(rotator):
     result = t.send("GET", "http://up.test/v1/models", headers={})
     assert isinstance(result, failover.SendResult)
     assert session.call_count == 2
+
+
+def test_all_nodes_failed_reports_true_attempt_count(rotator):
+    script = [FakeResponse(status=502) for _ in range(3)]
+    t, *_ , session = make_transport(rotator, script, max_retries=3)
+
+    result = t.send("GET", "http://up.test/v1", headers={})
+
+    assert isinstance(result, failover.AllNodesFailed)
+    assert result.attempts == 3
 
 
 def test_429_records_cooldown_and_retries_on_next_node(rotator):

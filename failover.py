@@ -100,6 +100,7 @@ class SendResult:
 @dataclass
 class AllNodesFailed:
     last_error: str | None
+    attempts: int = 0
 
 
 class FailoverTransport:
@@ -136,9 +137,11 @@ class FailoverTransport:
 
     def send(self, method, url, headers, payload=b"", stream=False):
         last_error = None
+        attempts = 0
         single_shot_post = method.upper() == "POST" and not self.retry_posts
         for attempt in range(self.max_retries):
             node = self.selector.select()
+            attempts += 1
 
             request_headers = {
                 k: v for k, v in headers.items()
@@ -154,6 +157,8 @@ class FailoverTransport:
 
             retry_after = None
             failed = False
+            next_action = ("not retrying: RETRY_POSTS=false" if single_shot_post
+                           else "Retrying...")
             try:
                 response = self.session.request(
                     method=method,
@@ -165,17 +170,17 @@ class FailoverTransport:
                     stream=stream,
                 )
             except Timeout as e:
-                logger.error(f"Timeout on Node {node.node_id}: {str(e)}. Retrying...")
+                logger.error(f"Timeout on Node {node.node_id}: {str(e)}. {next_action}")
                 last_error = f"Timeout: {str(e)}"
                 self.ledger.record_failure(node)
                 failed = True
             except ConnectionError as e:
-                logger.error(f"Connection error on Node {node.node_id}: {str(e)}. Retrying...")
+                logger.error(f"Connection error on Node {node.node_id}: {str(e)}. {next_action}")
                 last_error = f"Connection error: {str(e)}"
                 self.ledger.record_failure(node)
                 failed = True
             except RequestException as e:
-                logger.error(f"Request failed on Node {node.node_id}: {str(e)}. Retrying...")
+                logger.error(f"Request failed on Node {node.node_id}: {str(e)}. {next_action}")
                 last_error = f"Request error: {str(e)}"
                 self.ledger.record_failure(node)
                 failed = True
@@ -183,7 +188,7 @@ class FailoverTransport:
                 if response.status_code in RETRY_STATUSES:
                     logger.warning(
                         f"Node {node.node_id} returned HTTP {response.status_code}. "
-                        f"Retrying with next node..."
+                        f"{next_action}"
                     )
                     last_error = f"Upstream error: {response.status_code}"
                     retry_after = parse_retry_after(response.headers.get("Retry-After"))
@@ -204,7 +209,7 @@ class FailoverTransport:
                     )
 
             if single_shot_post and failed:
-                return AllNodesFailed(last_error=last_error)
+                return AllNodesFailed(last_error=last_error, attempts=attempts)
 
             if attempt < self.max_retries - 1:
                 self.sleep(compute_backoff(
@@ -215,4 +220,4 @@ class FailoverTransport:
                     backoff_max=self.backoff_max,
                 ))
 
-        return AllNodesFailed(last_error=last_error)
+        return AllNodesFailed(last_error=last_error, attempts=attempts)
