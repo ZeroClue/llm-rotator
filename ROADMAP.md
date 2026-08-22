@@ -78,11 +78,15 @@ per-thread sessions or disabling cookie persistence entirely.
 *Acceptance:* suite passes without cookie forwarding; concurrent-load smoke shows no
 cross-request cookie bleed.
 
-### 7. Cache key redesign or removal — `todo`
+### 7. Cache key redesign or removal — `done` (2026-08-22)
 The optimization cache is keyed on the MD5 of the entire message array; growing
 conversations ≈ never hit, so it mostly adds memory and risk. Either key on
-(stable prefix + model params), make hits append-aware, or remove the feature until
-a design exists that measurably hits.
+(stable prefix + model params), make hits append-aware, or remove the feature
+until a design exists that measurably hits.
+Amendment: removed outright (maintainer confirmed exact-repeats are unlikely);
+flags hard-deleted rather than deprecated-in-place — stale `.env` entries go
+inert. Determinism replaces memoization as the tested invariant. If multi-
+tenant scale ever appears, reintroduce behind a measured hit-rate design.
 *Acceptance:* measured hit-rate improvement on a simulated growing conversation, or
 feature removed with its config flags deprecated.
 

@@ -3,7 +3,7 @@
 Every test drives TokenOptimizer.optimize_context() with an explicit
 OptimizationConfig — no private-method probes, no flag-global
 monkeypatching. Stage behavior, purity, routing, gating, degradation,
-and cache eviction are all observed through the contract.
+and determinism are all observed through the contract.
 """
 
 import copy
@@ -19,6 +19,14 @@ def build(rotator, **overrides):
 
 def chat_payload(messages, **extra):
     return {"model": "gpt-4o", "messages": messages, **extra}
+
+
+BASIC_MSGS = [
+    {"role": "system", "content": "You are helpful."},
+    {"role": "user", "content": "q1"},
+    {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "q2"},
+]
 
 
 def test_routing_noop_for_non_chat_paths(rotator):
@@ -143,14 +151,6 @@ def test_repeated_identical_conversations_optimize_identically(rotator):
     assert first["messages"] == second["messages"]
     assert first["max_tokens"] == 123  # client value always honored now
     assert second["max_tokens"] == 456
-
-
-BASIC_MSGS = [
-    {"role": "system", "content": "You are helpful."},
-    {"role": "user", "content": "q1"},
-    {"role": "assistant", "content": "a1"},
-    {"role": "user", "content": "q2"},
-]
 
 
 def test_max_tokens_clamped_to_fit_budget(rotator, caplog):
