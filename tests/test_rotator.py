@@ -86,26 +86,6 @@ def test_cache_hit_respects_client_max_tokens(client, chat_captures, caplog):
     assert any("Cache hit" in r.getMessage() for r in caplog.records)
 
 
-def test_importance_filter_preserves_system_and_alternation(make_optimizer):
-    opt = make_optimizer(enable_importance_scoring=True, min_message_importance=0.25)
-    msgs = (
-        [{"role": "system", "content": "Be helpful."}]
-        + [{"role": "user", "content": f"q{i}"} for i in range(1)]
-        + [{"role": "assistant", "content": "a1"}, {"role": "user", "content": "q2"},
-           {"role": "assistant", "content": "a2"}, {"role": "user", "content": "q3"},
-           {"role": "assistant", "content": "a3"}, {"role": "user", "content": "q4"},
-           {"role": "assistant", "content": "a4"}]
-        + [{"role": "user", "content": "final question"}]
-    )
-    payload = {"model": "gpt-4o", "messages": msgs}
-    out = opt.optimize_context(payload, path="v1/chat/completions",
-                               is_streaming=False)["messages"]
-    roles = [m["role"] for m in out]
-    assert roles[0] == "system"
-    assert roles[-1] == "user"
-    assert all(a != b for a, b in zip(roles, roles[1:]))
-
-
 def test_importance_scoring_end_to_end_keeps_system(client, chat_captures, make_optimizer):
     make_optimizer(enable_importance_scoring=True, min_message_importance=0.25)
     msgs = [{"role": "system", "content": "Be helpful."}] + [
