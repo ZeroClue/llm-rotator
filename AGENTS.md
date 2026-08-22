@@ -41,6 +41,7 @@ Production runs use gunicorn (`gunicorn.conf.py`, gthread workers): `gunicorn -c
 - First startup with tiktoken downloads the tokenizer file for the default model unless cached — the Docker image pre-bakes it via `TIKTOKEN_CACHE_DIR`; bare-metal first runs need network or a warm cache.
 - llmlingua is intentionally absent from requirements.txt (pulls torch, ~2GB); install separately only if `ENABLE_SEMANTIC_COMPRESSION=true` is wanted.
 - **Keep `STREAM_DRAIN_WINDOW` below `GUNICORN_GRACEFUL_TIMEOUT`** — the terminal SSE event must flush before gunicorn's hard kill. Arming rides SIGTERM/SIGINT handlers chained by `create_app()` because gunicorn 26.1.0's `worker_int` hook never fires on SIGTERM (only INT/QUIT; verified in pinned source). That install must run on the main thread, so `--preload` (unused here) would break it.
+- **The container manager is an outer killer too**: plain `docker stop` grants 10s on standard Docker but only ~3s on Docker-29-desktop-style daemons (measured; reproduced with a stock Flask app, so not our code). If that grace expires first, streams are SIGKILLed with no terminal event. Ordering to enforce: `STREAM_DRAIN_WINDOW` < `GUNICORN_GRACEFUL_TIMEOUT` < `stop_grace_period` (compose sets 35s).
 
 ## Testing
 

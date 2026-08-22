@@ -6,6 +6,11 @@ services:
     image: llm-rotator:latest
     container_name: llm-rotator
     restart: unless-stopped
+    # The drain machinery needs to outlive every outer killer: gunicorn's
+    # graceful timeout (30s default) bounds the worker wait, and this grace
+    # must exceed IT so SIGKILL never lands mid-drain. Keep
+    # STREAM_DRAIN_WINDOW < GUNICORN_GRACEFUL_TIMEOUT < stop_grace_period.
+    stop_grace_period: 35s
     # Required: Tailscale's 100.64.x.x SOCKS5 endpoints are unreachable from
     # bridge networking. With host networking, PROXY_BIND_HOST=127.0.0.1 binds
     # the HOST's loopback.

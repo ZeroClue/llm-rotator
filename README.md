@@ -143,7 +143,7 @@ index and silently drops later nodes.
 | `NODE_COOLDOWN_BASE` | `2.0` | First-failure cooldown (seconds); doubles per consecutive failure |
 | `NODE_COOLDOWN_MAX` | `60.0` | Cooldown cap (seconds) |
 | `RETRY_POSTS` | `true` | `false` gives POSTs exactly one attempt — a 504/timeout may mean the upstream completed, so verbatim retries can double-bill |
-| `STREAM_DRAIN_WINDOW` | `20.0` | Graceful-shutdown drain window (seconds from SIGTERM) for in-flight SSE streams: they finish naturally inside it, otherwise they end with a terminal `proxy_shutdown` error event + `[DONE]`. Keep below `GUNICORN_GRACEFUL_TIMEOUT`; `0` cuts on the next chunk |
+| `STREAM_DRAIN_WINDOW` | `20.0` | Graceful-shutdown drain window (seconds from SIGTERM) for in-flight SSE streams: they finish naturally inside it, otherwise they end with a terminal `proxy_shutdown` error event + `[DONE]`. Keep it below **every** outer killer — `GUNICORN_GRACEFUL_TIMEOUT` *and* your container manager's stop grace (`stop_grace_period`, `docker stop -t`, systemd `TimeoutStopSec`); `0` cuts on the next chunk |
 | `DEFAULT_MODEL` | `gpt-4o` | Model used for token counting |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `LOG_FORMAT` | `text` | `json` emits one structured object per line (`ts`, `level`, `logger`, `message`, plus `request_id`/`node_id`/`outcome` fields on lifecycle events) |
