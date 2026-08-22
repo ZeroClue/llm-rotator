@@ -238,38 +238,38 @@ def test_ledger_rejects_out_of_pool_nodes(rotator):
 
 def test_cooldown_skips_recently_failed_node(rotator):
     clock = FakeClock(start=100.0)
-    it, ledger = make_selector(rotator)
+    selector, ledger = make_selector(rotator)
 
-    first = it.select(now=clock.now)
+    first = selector.select(now=clock.now)
     assert first.node_id == 1
     ledger.record_failure(first, now=clock.now)
-    assert [it.select(now=clock.now).node_id for _ in range(3)] == [2, 2, 2]
+    assert [selector.select(now=clock.now).node_id for _ in range(3)] == [2, 2, 2]
     clock.advance(29)  # cooldown deadline is t=130; still cooling at t=129
-    assert it.select(now=clock.now).node_id == 2
+    assert selector.select(now=clock.now).node_id == 2
     clock.advance(2)  # t=131, past the deadline
-    assert it.select(now=clock.now).node_id == 1
+    assert selector.select(now=clock.now).node_id == 1
 
 
 def test_never_starves_when_all_nodes_are_cooling(rotator):
     clock = FakeClock(start=100.0)
-    it, ledger = make_selector(rotator)
+    selector, ledger = make_selector(rotator)
 
-    node1 = it.select(now=clock.now)
+    node1 = selector.select(now=clock.now)
     ledger.record_failure(node1, now=clock.now)
-    node2 = it.select(now=clock.now)
+    node2 = selector.select(now=clock.now)
     ledger.record_failure(node2, now=clock.now)
     # Both nodes cooling: the never-starve rule serves the cursor node anyway.
-    assert [it.select(now=clock.now).node_id for _ in range(2)] == [1, 2]
+    assert [selector.select(now=clock.now).node_id for _ in range(2)] == [1, 2]
 
 
 def test_record_success_clears_cooldown(rotator):
-    it, ledger = make_selector(rotator, cooldown_base=60.0, cooldown_max=60.0)
+    selector, ledger = make_selector(rotator, cooldown_base=60.0, cooldown_max=60.0)
 
-    node = it.select()
+    node = selector.select()
     ledger.record_failure(node)
-    assert it.select().node_id == 2
+    assert selector.select().node_id == 2
     ledger.record_success(node)
-    assert it.select().node_id == 1
+    assert selector.select().node_id == 1
 
 
 def test_cooldown_doubles_and_caps_through_public_interface(rotator):

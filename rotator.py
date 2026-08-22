@@ -264,6 +264,20 @@ class HealthLedger:
         with self._lock:
             return self._entry(node)["consecutive_failures"]
 
+    def health_state(self, now=None):
+        """All nodes' {consecutive_failures, cooldown_seconds} under one lock
+        and a single clock reading, so a report can't tear the pair apart."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            return {
+                nid: {
+                    "consecutive_failures": e["consecutive_failures"],
+                    "cooldown_seconds": round(max(0.0, e["fail_until"] - now), 3),
+                }
+                for nid, e in self._state.items()
+            }
+
     def record_success(self, node):
         with self._lock:
             entry = self._entry(node)
@@ -328,11 +342,12 @@ class NodeSelector:
 
 def node_health_snapshot(nodes, ledger, now=None):
     """Public per-node view for health checks (never includes keys)."""
+    state = ledger.health_state(now=now)
     return [{
         "node_id": n.node_id,
         "proxy": n.proxy,
-        "consecutive_failures": ledger.failure_count(n),
-        "cooldown_seconds": round(ledger.cooldown_remaining(n, now=now), 3),
+        "consecutive_failures": state[n.node_id]["consecutive_failures"],
+        "cooldown_seconds": state[n.node_id]["cooldown_seconds"],
     } for n in nodes]
 
 
@@ -1080,18 +1095,20 @@ def dynamic_failover_proxy(path):
 
 def nodes_available_count():
     """Nodes not currently in cooldown, per the ledger's own clock."""
-    return sum(1 for n in NODE_POOL if health_ledger.usable(n))
+    state = health_ledger.health_state()
+    return sum(1 for e in state.values() if e["cooldown_seconds"] <= 0)
 
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for monitoring."""
+    nodes = node_health_snapshot(NODE_POOL, health_ledger)
     return jsonify({
         "status": "healthy",
         "nodes_configured": len(NODE_POOL),
-        "nodes_available": nodes_available_count(),
+        "nodes_available": sum(1 for e in nodes if e["cooldown_seconds"] <= 0),
         "current_node_index": node_selector.current_index,
-        "nodes": node_health_snapshot(NODE_POOL, health_ledger),
+        "nodes": nodes,
         "token_optimization_enabled": ENABLE_CONTEXT_COMPRESSION,
         "max_context_tokens": MAX_CONTEXT_TOKENS,
         "reserved_response_tokens": RESERVED_RESPONSE_TOKENS
