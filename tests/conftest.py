@@ -3,10 +3,11 @@ import os
 import sys
 
 import pytest
-import rotator as rotator_module
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import rotator as rotator_module
 
 from mock_upstream import MockUpstream
 

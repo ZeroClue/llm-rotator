@@ -356,8 +356,13 @@ def test_log_level_env_var_is_effective(rotator):
     debug_settings = dataclasses.replace(rotator.settings, log_level="DEBUG")
     info_settings = dataclasses.replace(rotator.settings, log_level="INFO")
 
-    rotator.configure_logging(debug_settings)
-    assert logging.getLogger().isEnabledFor(logging.DEBUG) is True
+    try:
+        rotator.configure_logging(debug_settings)
+        assert logging.getLogger().isEnabledFor(logging.DEBUG) is True
 
-    rotator.configure_logging(info_settings)
-    assert logging.getLogger().isEnabledFor(logging.DEBUG) is False
+        rotator.configure_logging(info_settings)
+        assert logging.getLogger().isEnabledFor(logging.DEBUG) is False
+    finally:
+        # configure_logging mutates the root logger globally; restore the
+        # process's real configuration so later tests aren't affected.
+        rotator.configure_logging(rotator.settings)

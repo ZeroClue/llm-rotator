@@ -28,12 +28,6 @@ from werkzeug.exceptions import HTTPException
 
 from failover import AllNodesFailed, FailoverTransport
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    force=True
-)
 logger = logging.getLogger(__name__)
 
 # Try to import tiktoken for token counting (optional but recommended)
@@ -359,20 +353,17 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
 
 
 # Built lazily on first attribute access so gunicorn's `rotator:app` works
-# while a bare `import rotator` constructs nothing.
-_app_built = False
-
-
+# while a bare `import rotator` constructs nothing. The `app` global comes
+# into existence only when something builds it — deliberately NOT declared
+# as a placeholder, or `rotator:app` would resolve to None without building.
 def get_app() -> Flask:
     """Build the Flask app from the environment once; cached thereafter."""
-    global app, _app_built
-    if not _app_built:
+    if globals().get("app") is None:
         try:
             create_app()
         except Exception as e:
             logger.critical(f"Failed to initialize proxy: {e}")
             raise SystemExit(1)
-        _app_built = True
     return app
 
 

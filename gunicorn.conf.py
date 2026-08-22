@@ -1,7 +1,7 @@
 import os
 
-# Container convention is to bind all interfaces; the compose file narrows
-# this to loopback because the proxy itself has no authentication.
+# Loopback by default, matching rotator.py: the proxy has no built-in
+# authentication. Set PROXY_BIND_HOST=0.0.0.0 explicitly to expose it.
 bind = f"{os.getenv('PROXY_BIND_HOST', '127.0.0.1')}:{os.getenv('PROXY_BIND_PORT', '8080')}"
 
 worker_class = "gthread"
