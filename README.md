@@ -108,8 +108,8 @@ index and silently drops later nodes.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROXY_BIND_HOST` | `127.0.0.1` | Bind host. Read by both servers, but their unset-fallbacks differ: `python rotator.py` falls back to loopback, gunicorn to `0.0.0.0` — set this var explicitly in production (drift tracked by roadmap #15) |
-| `PROXY_BIND_PORT` | `8080` | Bind port |
+| `PROXY_BIND_HOST` | `127.0.0.1` | Bind host — both `python rotator.py` and gunicorn read the same var with the same loopback fallback; set `0.0.0.0` only if you truly want all interfaces |
+| `PROXY_BIND_PORT` | `8080` | Bind port (the compose healthcheck follows this) |
 | `LLM_PROVIDER_URL` | `https://api.openai.com/v1` | Upstream provider base URL |
 | `MAX_RETRIES` | `4` | Attempts across nodes per request |
 | `REQUEST_TIMEOUT` | `25.0` | Per-attempt upstream timeout (seconds) |

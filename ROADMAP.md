@@ -129,13 +129,17 @@ lands inside the view's loop body (:861–1020, ~21 responsibilities). From the
 module; "429 → cooldown → retry" and 502-exhaustion unit-tested without HTTP;
 the drift-twin logic is deleted.
 
-### 15. App factory replacing import-time execution — `todo`
+### 15. App factory replacing import-time execution — `done` (2026-08-22)
 Move node-pool/session/optimizer/logging construction out of module scope into a
 factory that builds settings → services → Flask app; keep a gunicorn-compatible
 module-level `app` as a one-line call to it. Fold in the env-contract cleanup:
 Dockerfile/compose healthchecks and gunicorn bind defaults read the same settings
 instead of drifting copies (compose hardcodes `:8080` today; bind default differs
 between rotator.py and gunicorn.conf.py).
+Amendment: `create_app(cfg, optimization_config)` + PEP 562 lazy `rotator.app`
+(bare import constructs nothing); frozen `Settings`; factory assigns the existing
+module globals so views/tests kept their seams. Bind defaults unified on loopback;
+compose healthcheck follows `$PROXY_BIND_PORT`. Design record: issue #27.
 *Rationale:* importing `rotator` executes everything and `SystemExit(1)`s when
 unconfigured; config frozen per process forces three escalating test workarounds
 (conftest env-before-import, env scrubbing in the streaming test,
