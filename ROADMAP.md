@@ -195,10 +195,17 @@ or HTTP.
 
 ## Later (nice-to-have / strategic)
 
-### 9. Observability — `todo`
+### 9. Observability — `done` (2026-08-22, issue #34)
 Request IDs (generate + echo via header), structured logging (JSON option),
 per-node success/failure counters exposed in `/health`, optional Prometheus
 endpoint. Prerequisite for operating multi-node pools with confidence.
+Amendment (design settled 2026-08-22, issue #34): request IDs honor inbound
+`X-Request-Id` (sanitized) else `uuid4().hex`, echoed on every response,
+proxy-local (not forwarded upstream); `LOG_FORMAT=json` stdlib formatter with
+structured extras on the ~7 request-lifecycle sites; counters recorded at the
+ledger's existing mutation sites, surfaced additively in `/health`; `/metrics`
+hand-rolled text exposition, unauthenticated like `/health`, no new dependency.
+Non-goals: histograms, per-path labels, persistence, upstream forwarding.
 
 ### 10. Supply-chain hardening — `todo`
 Digest-pin `python:3.12-slim`, add OCI labels, consider multi-stage build,

@@ -22,9 +22,11 @@ import time
 import signal
 import logging
 import threading
+import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
 
-from flask import Flask, request, Response, jsonify, stream_with_context
+from flask import Flask, g, request, Response, jsonify, stream_with_context
 from werkzeug.exceptions import HTTPException
 
 from failover import AllNodesFailed, FailoverTransport
@@ -80,6 +82,9 @@ class Settings:
     # Optional bearer-token gate. Empty disables auth entirely. /health and
     # /ready stay open either way so orchestrators can probe without the token.
     auth_token: str = ""
+    # "text" keeps the classic human format; "json" emits one structured
+    # object per line (see JsonFormatter).
+    log_format: str = "text"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -98,15 +103,53 @@ class Settings:
             stream_drain_window=float(os.getenv("STREAM_DRAIN_WINDOW", "20.0")),
             default_model=os.getenv("DEFAULT_MODEL", "gpt-4o"),
             auth_token=os.getenv("PROXY_AUTH_TOKEN", ""),
+            log_format=os.getenv("LOG_FORMAT", "text"),
         )
+
+
+class JsonFormatter(logging.Formatter):
+    """One JSON object per log line: a stable envelope (ts/level/logger/
+    message) plus whatever structured extras the call site attached. Prose
+    messages are preserved verbatim inside `message`."""
+
+    # LogRecord attributes that belong to the envelope or the logging
+    # machinery itself; everything else on the record is an extra.
+    _ENVELOPE = frozenset({
+        "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+        "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+        "created", "msecs", "relativeCreated", "thread", "threadName",
+        "processName", "process", "taskName", "message", "asctime",
+    })
+
+    def format(self, record):
+        entry = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key not in self._ENVELOPE:
+                entry[key] = value
+        if record.exc_info:
+            entry["exc"] = self.formatException(record.exc_info)
+        return json.dumps(entry, default=str)
 
 
 def configure_logging(settings):
     """(Re)apply root logging config; safe to call per app build."""
+    if settings.log_format == "json":
+        formatter = JsonFormatter()
+    else:
+        # Explicit so text output stays byte-identical regardless of how
+        # handlers are attached below.
+        formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format='%(asctime)s [%(levelname)s] %(message)s',
         force=True,
+        handlers=[handler],
     )
 
 
@@ -196,8 +239,26 @@ token_optimizer = None
 shutdown_state = None
 
 
+def assign_request_id():
+    """Honor a sanitized inbound X-Request-Id, else generate one. Registered
+    before the auth gate so even rejected requests carry an id; echoed on
+    every response (after_response) and bound into error bodies/logs."""
+    raw = request.headers.get("X-Request-Id", "")
+    candidate = raw.strip()
+    if candidate and len(candidate) <= 128 and all(32 <= ord(c) < 127 for c in candidate):
+        g.request_id = candidate
+    else:
+        g.request_id = uuid.uuid4().hex
+    return None
+
+
+def echo_request_id(response):
+    response.headers["X-Request-Id"] = g.get("request_id", "")
+    return response
+
+
 def require_bearer_token():
-    if not settings.auth_token or request.path in ("/health", "/ready"):
+    if not settings.auth_token or request.path in ("/health", "/ready", "/metrics"):
         return None
     provided = request.headers.get("Authorization", "")
     # Bytes, not str: compare_digest raises TypeError on non-ASCII str, and
@@ -210,7 +271,8 @@ def require_bearer_token():
                 "error": {
                     "message": "Invalid or missing bearer token",
                     "type": "auth_error",
-                }
+                },
+                "request_id": g.get("request_id", ""),
             }),
             401,
             {"Content-Type": "application/json"},
@@ -232,7 +294,15 @@ class HealthLedger:
         # while calling usable(); separate locks would break that atomicity.
         self._lock = lock if lock is not None else threading.RLock()
         self._state = {
-            n.node_id: {"consecutive_failures": 0, "fail_until": 0.0}
+            n.node_id: {
+                "consecutive_failures": 0,
+                "fail_until": 0.0,
+                # Lifetime attempt outcomes (observability): recorded at the
+                # same lock-guarded sites as health state so a report can't
+                # tear them apart. reset_all() deliberately preserves these.
+                "total_successes": 0,
+                "total_failures": 0,
+            }
             for n in nodes
         }
 
@@ -261,8 +331,9 @@ class HealthLedger:
             return self._entry(node)["consecutive_failures"]
 
     def health_state(self, now=None):
-        """All nodes' {consecutive_failures, cooldown_seconds} under one lock
-        and a single clock reading, so a report can't tear the pair apart."""
+        """All nodes' {consecutive_failures, cooldown_seconds, lifetime
+        totals} under one lock and a single clock reading, so a report can't
+        tear the pair apart."""
         if now is None:
             now = time.monotonic()
         with self._lock:
@@ -270,6 +341,8 @@ class HealthLedger:
                 nid: {
                     "consecutive_failures": e["consecutive_failures"],
                     "cooldown_seconds": round(max(0.0, e["fail_until"] - now), 3),
+                    "total_successes": e["total_successes"],
+                    "total_failures": e["total_failures"],
                 }
                 for nid, e in self._state.items()
             }
@@ -279,6 +352,7 @@ class HealthLedger:
             entry = self._entry(node)
             entry["consecutive_failures"] = 0
             entry["fail_until"] = 0.0
+            entry["total_successes"] += 1
 
     def record_failure(self, node, now=None):
         if now is None:
@@ -286,6 +360,7 @@ class HealthLedger:
         with self._lock:
             entry = self._entry(node)
             entry["consecutive_failures"] += 1
+            entry["total_failures"] += 1
             cooldown = min(
                 self._cooldown_max,
                 self._cooldown_base * (2 ** (entry["consecutive_failures"] - 1)),
@@ -344,6 +419,8 @@ def node_health_snapshot(nodes, ledger, now=None):
         "proxy": n.proxy,
         "consecutive_failures": state[n.node_id]["consecutive_failures"],
         "cooldown_seconds": state[n.node_id]["cooldown_seconds"],
+        "total_successes": state[n.node_id]["total_successes"],
+        "total_failures": state[n.node_id]["total_failures"],
     } for n in nodes]
 
 
@@ -396,8 +473,11 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
     )
     application.add_url_rule("/health", "health_check", health_check)
     application.add_url_rule("/ready", "ready_check", ready_check)
+    application.add_url_rule("/metrics", "metrics", metrics)
     application.add_url_rule("/v1/models", "list_models", list_models)
+    application.before_request(assign_request_id)
     application.before_request(require_bearer_token)
+    application.after_request(echo_request_id)
     application.register_error_handler(Exception, handle_exception)
     app = application
     return app
@@ -1062,7 +1142,7 @@ TERMINAL_SSE_EVENT = (
 )
 
 
-def guarded_stream(chunks, *, state):
+def guarded_stream(chunks, *, state, request_id=""):
     """Wrap a streamed upstream body with shutdown awareness.
 
     Passes chunks through verbatim while the process is not draining; once
@@ -1076,6 +1156,10 @@ def guarded_stream(chunks, *, state):
         try:
             for chunk in chunks:
                 if state.draining():
+                    logger.warning(
+                        "Draining: cutting in-flight SSE stream with terminal event",
+                        extra={"event": "stream_drain_cut", "request_id": request_id},
+                    )
                     yield TERMINAL_SSE_EVENT
                     return
                 yield chunk
@@ -1192,6 +1276,12 @@ def dynamic_failover_proxy(path):
 
     # Construct the full target URL
     url = f"{settings.target_provider_url}/{path}"
+    request_id = g.get("request_id", "")
+    logger.info(
+        f"Proxying {method} /v1/{path} (streaming={stream_upstream})",
+        extra={"event": "proxy_request", "request_id": request_id,
+               "method": method, "path": path, "streaming": stream_upstream},
+    )
 
     result = transport.send(
         method=method,
@@ -1199,12 +1289,15 @@ def dynamic_failover_proxy(path):
         headers=dict(request.headers),
         payload=payload,
         stream=stream_upstream,
+        request_id=request_id,
     )
 
     if isinstance(result, AllNodesFailed):
         logger.critical(
             f"All retry attempts exhausted ({result.attempts} attempt(s), "
-            f"MAX_RETRIES={settings.max_retries}). Last error: {result.last_error}"
+            f"MAX_RETRIES={settings.max_retries}). Last error: {result.last_error}",
+            extra={"event": "all_nodes_failed", "request_id": request_id,
+                   "attempts": result.attempts, "max_retries": settings.max_retries},
         )
         return Response(
             json.dumps({
@@ -1212,7 +1305,8 @@ def dynamic_failover_proxy(path):
                     "message": "Proxy Gateway Error: All backend nodes exhausted or rate-limited",
                     "type": "gateway_error",
                     "last_error": result.last_error
-                }
+                },
+                "request_id": g.get("request_id", ""),
             }),
             502,
             {"Content-Type": "application/json"}
@@ -1220,7 +1314,8 @@ def dynamic_failover_proxy(path):
 
     if stream_upstream:
         return Response(
-            guarded_stream(result.body(), state=shutdown_state),
+            guarded_stream(result.body(), state=shutdown_state,
+                           request_id=request_id),
             result.status_code, result.header_pairs,
         )
 
@@ -1234,7 +1329,12 @@ def dynamic_failover_proxy(path):
                 logger.info(
                     f"Token usage - Prompt: {usage.get('prompt_tokens', 'N/A')}, "
                     f"Completion: {usage.get('completion_tokens', 'N/A')}, "
-                    f"Total: {usage.get('total_tokens', 'N/A')}"
+                    f"Total: {usage.get('total_tokens', 'N/A')}",
+                    extra={"event": "token_usage", "request_id": request_id,
+                           "node_id": result.node_id,
+                           "prompt_tokens": usage.get("prompt_tokens"),
+                           "completion_tokens": usage.get("completion_tokens"),
+                           "total_tokens": usage.get("total_tokens")},
                 )
         except Exception:
             pass
@@ -1246,6 +1346,36 @@ def nodes_available_count():
     """Nodes not currently in cooldown, per the ledger's own clock."""
     state = health_ledger.health_state()
     return sum(1 for e in state.values() if e["cooldown_seconds"] <= 0)
+
+
+def metrics():
+    """Prometheus text exposition of the per-node lifetime counters and a
+    usable-node gauge. Hand-rolled on purpose: the format for two counters
+    and one gauge is ~15 lines, not a dependency."""
+    state = health_ledger.health_state()
+    # Recompute from the same `state` snapshot rather than calling
+    # nodes_available_count(): one lock/clock read keeps gauge and counters
+    # from tearing apart.
+    available = sum(1 for e in state.values() if e["cooldown_seconds"] <= 0)
+    lines = [
+        "# HELP llm_rotator_node_requests_total Lifetime upstream attempt outcomes per node.",
+        "# TYPE llm_rotator_node_requests_total counter",
+    ]
+    for nid in sorted(state):
+        lines.append(
+            f'llm_rotator_node_requests_total{{node_id="{nid}",outcome="success"}} '
+            f'{state[nid]["total_successes"]}'
+        )
+        lines.append(
+            f'llm_rotator_node_requests_total{{node_id="{nid}",outcome="failure"}} '
+            f'{state[nid]["total_failures"]}'
+        )
+    lines.extend([
+        "# HELP llm_rotator_nodes_available Nodes not currently in cooldown.",
+        "# TYPE llm_rotator_nodes_available gauge",
+        f"llm_rotator_nodes_available {available}",
+    ])
+    return Response("\n".join(lines) + "\n", mimetype="text/plain")
 
 
 def health_check():
@@ -1280,7 +1410,10 @@ def list_models():
     )
     if isinstance(result, AllNodesFailed):
         logger.error(f"Failed to fetch models: {result.last_error}")
-        return jsonify({"error": "Failed to fetch models from upstream"}), 502
+        return jsonify({
+            "error": "Failed to fetch models from upstream",
+            "request_id": g.get("request_id", ""),
+        }), 502
     return Response(result.body(), result.status_code, result.header_pairs)
 
 
@@ -1288,12 +1421,17 @@ def handle_exception(e):
     """Global exception handler; HTTP errors keep their own status codes."""
     if isinstance(e, HTTPException):
         return e
-    logger.exception(f"Unhandled exception: {e}")
+    logger.exception(
+        f"Unhandled exception: {e}",
+        extra={"event": "unhandled_exception",
+               "request_id": g.get("request_id", "")},
+    )
     return jsonify({
         "error": {
             "message": "Internal proxy error",
             "type": "internal_error"
-        }
+        },
+        "request_id": g.get("request_id", ""),
     }), 500
 
 

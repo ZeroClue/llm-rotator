@@ -99,8 +99,9 @@ docker run -d \
 |----------|---------|-------------|
 | `/v1/<path>` | GET, POST, PUT, DELETE, PATCH | Proxied upstream call with rotation + failover |
 | `/v1/models` | GET | Model listing with full failover |
-| `/health` | GET | Process health + per-node status (stays open when auth is on) |
+| `/health` | GET | Process health + per-node status incl. lifetime `total_successes`/`total_failures` (stays open when auth is on) |
 | `/ready` | GET | Readiness: 503 while every node is in cooldown |
+| `/metrics` | GET | Prometheus text exposition: per-node attempt counters + usable-node gauge (stays open when auth is on) |
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`.
 
@@ -145,7 +146,8 @@ index and silently drops later nodes.
 | `STREAM_DRAIN_WINDOW` | `20.0` | Graceful-shutdown drain window (seconds from SIGTERM) for in-flight SSE streams: they finish naturally inside it, otherwise they end with a terminal `proxy_shutdown` error event + `[DONE]`. Keep below `GUNICORN_GRACEFUL_TIMEOUT`; `0` cuts on the next chunk |
 | `DEFAULT_MODEL` | `gpt-4o` | Model used for token counting |
 | `LOG_LEVEL` | `INFO` | Logging level |
-| `PROXY_AUTH_TOKEN` | *(empty)* | Optional bearer gate: when set, `/v1/*` requires `Authorization: Bearer <token>` (401 otherwise). `/health` and `/ready` stay open |
+| `LOG_FORMAT` | `text` | `json` emits one structured object per line (`ts`, `level`, `logger`, `message`, plus `request_id`/`node_id`/`outcome` fields on lifecycle events) |
+| `PROXY_AUTH_TOKEN` | *(empty)* | Optional bearer gate: when set, `/v1/*` requires `Authorization: Bearer <token>` (401 otherwise). `/health`, `/ready`, and `/metrics` stay open |
 
 ### Nodes (repeat contiguously from 1)
 

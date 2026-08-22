@@ -48,9 +48,11 @@ The period after a node failure during which rotation skips that node;
 grows exponentially with consecutive failures up to a cap.
 
 **Health ledger**:
-The per-node record of consecutive failures and cooldown deadlines — the
-authority rotation consults to decide whether a node is usable. Distinct
-from the cursor, which only tracks pool position.
+The per-node record of consecutive failures and cooldown deadlines plus
+lifetime attempt outcomes (success/failure counts) — the authority rotation
+consults to decide whether a node is usable, and the source health and
+metrics views read. Distinct from the cursor, which only tracks pool
+position.
 
 **Never-starve rule**:
 When every node is in cooldown, rotation uses the cursor node anyway rather
