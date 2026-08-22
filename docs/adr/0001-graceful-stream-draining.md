@@ -27,7 +27,11 @@ proxy with a well-formed terminal SSE event (OpenAI-style error object +
   cannot preempt a blocked socket read. The dev-server watchdog likewise
   grants a short settle beat after the window elapses so guards can flush
   the terminal event before exit — a very slow upstream gap can still lose
-  that race.
+  that race. And the container manager is an outer killer of its own: if
+  its stop grace (`docker stop -t`, systemd `TimeoutStopSec`, compose
+  `stop_grace_period`) expires before the drain window, streams are
+  SIGKILLed with no terminal event. Enforce
+  `STREAM_DRAIN_WINDOW` < `GUNICORN_GRACEFUL_TIMEOUT` < stop grace.
 - The guard lives in the view layer (rotator.py), not failover.py: the
   transport knows nothing about SSE framing.
 - One global deadline is fixed at arm time and binds every stream equally:
