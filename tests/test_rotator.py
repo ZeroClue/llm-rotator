@@ -73,19 +73,6 @@ def test_usage_logged_for_buffered_responses(client, caplog):
     assert any("Token usage" in r.getMessage() for r in caplog.records)
 
 
-def test_cache_hit_respects_client_max_tokens(client, chat_captures, caplog):
-    import logging
-    payload = {"model": "gpt-4o", "messages": BASIC_MESSAGES}
-    with caplog.at_level(logging.INFO, logger="rotator"):
-        r1 = client.post("/v1/chat/completions", json={**payload, "max_tokens": 123})
-        r2 = client.post("/v1/chat/completions", json={**payload, "max_tokens": 456})
-    assert r1.status_code == r2.status_code == 200
-    posts = chat_captures()
-    assert jload(posts[-2]["body"])["max_tokens"] == 123
-    assert jload(posts[-1]["body"])["max_tokens"] == 456
-    assert any("Cache hit" in r.getMessage() for r in caplog.records)
-
-
 def test_importance_scoring_end_to_end_keeps_system(client, chat_captures, make_optimizer):
     make_optimizer(enable_importance_scoring=True, min_message_importance=0.25)
     msgs = [{"role": "system", "content": "Be helpful."}] + [

@@ -36,7 +36,7 @@ def test_gate_noop_when_disabled(rotator):
 
 
 def test_dedup_collapses_consecutive_duplicates_only(rotator):
-    opt = build(rotator, enable_context_cache=False)
+    opt = build(rotator)
     msgs = [
         {"role": "user", "content": "q"},
         {"role": "assistant", "content": "a"},
@@ -52,7 +52,7 @@ def test_dedup_collapses_consecutive_duplicates_only(rotator):
 
 
 def test_purity_input_is_never_mutated(rotator):
-    opt = build(rotator, enable_context_cache=False)
+    opt = build(rotator)
     msgs = [
         {"role": "system", "content": "Be  helpful.\n\n\n\nReally."},
         {"role": "user", "content": "q\n\n\n\nwith   spaces"},
@@ -71,7 +71,7 @@ def test_purity_input_is_never_mutated(rotator):
 
 
 def test_truncation_ladder_fits_budget_and_keeps_system_and_last_user(rotator):
-    opt = build(rotator, enable_context_cache=False, remove_duplicates=False,
+    opt = build(rotator, remove_duplicates=False,
                 strip_whitespace=False, max_context_tokens=600,
                 reserved_response_tokens=0)
     filler = "word " * 60  # ~60+ tokens per message
@@ -88,7 +88,7 @@ def test_truncation_ladder_fits_budget_and_keeps_system_and_last_user(rotator):
 
 
 def test_aggressive_truncation_fallback_when_verification_fails(rotator, caplog):
-    opt = build(rotator, enable_context_cache=False, remove_duplicates=False,
+    opt = build(rotator, remove_duplicates=False,
                 strip_whitespace=False, max_context_tokens=200,
                 reserved_response_tokens=0)
     huge_system = "You are helpful. " * 400  # cannot be dropped, busts any budget
@@ -102,23 +102,16 @@ def test_aggressive_truncation_fallback_when_verification_fails(rotator, caplog)
     assert out["messages"][0]["role"] == "system"
 
 
-def test_streaming_fastpath_skips_cache_and_expensive_stages(rotator, caplog):
+def test_streaming_fastpath_skips_expensive_stages(rotator):
     opt = build(rotator, enable_importance_scoring=True)
     msgs = [
         {"role": "user", "content": "hello\n\n\n\nworld"},
         {"role": "user", "content": "hello\n\n\n\nworld"},  # duplicate
     ]
 
-    with caplog.at_level("INFO", logger="rotator"):
-        out = opt.optimize_context(chat_payload(msgs), path="v1/chat/completions",
-                                   is_streaming=True)["messages"]
-        assert [m["content"] for m in out] == ["hello\n\nworld"]  # deduped + stripped
-        assert not any("Cache hit" in r.getMessage() for r in caplog.records)
-
-        # Identical buffered request hits the cache; the streamed one did not populate it.
-        opt.optimize_context(chat_payload(msgs), path="v1/chat/completions")
-        opt.optimize_context(chat_payload(msgs), path="v1/chat/completions")
-        assert sum(1 for r in caplog.records if "Cache hit" in r.getMessage()) == 1
+    out = opt.optimize_context(chat_payload(msgs), path="v1/chat/completions",
+                               is_streaming=True)["messages"]
+    assert [m["content"] for m in out] == ["hello\n\nworld"]  # deduped + stripped
 
 
 def test_error_degradation_returns_input_unoptimized(rotator, caplog, monkeypatch):
@@ -126,9 +119,9 @@ def test_error_degradation_returns_input_unoptimized(rotator, caplog, monkeypatc
     payload = chat_payload([{"role": "user", "content": "precious"}])
 
     def boom(*args, **kwargs):
-        raise RuntimeError("cache exploded")
+        raise RuntimeError("token counter exploded")
 
-    monkeypatch.setattr(opt, "_hash_content", boom)
+    monkeypatch.setattr(opt, "count_message_tokens", boom)
     with caplog.at_level("ERROR", logger="rotator"):
         result = opt.optimize_context(payload, path="v1/chat/completions")
 
@@ -136,28 +129,32 @@ def test_error_degradation_returns_input_unoptimized(rotator, caplog, monkeypatc
     assert any("forwarding payload unoptimized" in r.getMessage() for r in caplog.records)
 
 
-def test_lru_eviction_observed_through_behavior(rotator, caplog):
-    opt = build(rotator, context_cache_size=1)
+def test_repeated_identical_conversations_optimize_identically(rotator):
+    """Determinism replaces memoization: no cache, so every request runs the
+    pipeline fresh — identical inputs must yield byte-identical outputs,
+    and client-specific fields like max_tokens are always honored."""
+    opt = build(rotator)
 
-    def ask(i):
-        with caplog.at_level("INFO", logger="rotator"):
-            opt.optimize_context(
-                chat_payload([{"role": "user", "content": f"unique-{i}"}]),
-                path="v1/chat/completions",
-            )
+    first = opt.optimize_context(
+        chat_payload(BASIC_MSGS, max_tokens=123), path="v1/chat/completions")
+    second = opt.optimize_context(
+        chat_payload(BASIC_MSGS, max_tokens=456), path="v1/chat/completions")
 
-    ask("a")
-    ask("b")            # evicts a
-    ask("b")            # Cache hit
-    hits_after_b = sum(1 for r in caplog.records if "Cache hit" in r.getMessage())
-    ask("a")            # was evicted: no hit possible
-    hits_total = sum(1 for r in caplog.records if "Cache hit" in r.getMessage())
-    assert hits_after_b == 1
-    assert hits_total == 1  # re-asking evicted "a" must not register a hit
+    assert first["messages"] == second["messages"]
+    assert first["max_tokens"] == 123  # client value always honored now
+    assert second["max_tokens"] == 456
+
+
+BASIC_MSGS = [
+    {"role": "system", "content": "You are helpful."},
+    {"role": "user", "content": "q1"},
+    {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "q2"},
+]
 
 
 def test_max_tokens_clamped_to_fit_budget(rotator, caplog):
-    opt = build(rotator, enable_context_cache=False, max_context_tokens=1000,
+    opt = build(rotator, max_context_tokens=1000,
                 reserved_response_tokens=0)
 
     greedy = opt.optimize_context(
@@ -175,7 +172,7 @@ def test_max_tokens_clamped_to_fit_budget(rotator, caplog):
 
 
 def test_importance_filter_preserves_system_and_alternation(rotator):
-    opt = build(rotator, enable_context_cache=False,
+    opt = build(rotator,
                 enable_importance_scoring=True, min_message_importance=0.25)
     msgs = (
         [{"role": "system", "content": "Be helpful."}]

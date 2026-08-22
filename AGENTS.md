@@ -44,7 +44,7 @@ Production runs use gunicorn (`gunicorn.conf.py`, gthread workers): `gunicorn -c
 - `tests/test_rotator.py` runs against Flask's test client with two env-configured nodes: node 1 is a dead port (exercises failover), node 2 is `MockUpstream` (`tests/mock_upstream.py`), a scriptable OpenAI-compatible upstream that captures every request.
 - `tests/test_failover.py` drives `FailoverTransport` directly with a scripted fake session, recording sleeper, and stubbed rng — retry/failover logic is tested without HTTP or real sleeps.
 - `tests/test_streaming_live.py` spawns `rotator.py` as a subprocess and asserts chunks arrive incrementally (TTFB well before completion); it scrubs inherited `PROXY_*`/`API_KEY_*`/`LLM_PROVIDER_URL` env vars first.
-- Flag-specific tests flip module globals via `monkeypatch.setattr(rotator, ...)` instead of re-importing; transport/cooldown knobs are constructor-injected instead — build fakes explicitly. Clear `token_optimizer.context_cache` between tests if you add cache-sensitive cases.
+- Flag-specific tests flip module globals via `monkeypatch.setattr(rotator, ...)` instead of re-importing; transport/cooldown/optimization knobs are constructor-injected instead — build fakes explicitly.
 
 ## Deployment
 
