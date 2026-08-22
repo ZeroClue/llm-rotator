@@ -43,8 +43,8 @@ def parse_retry_after(value):
     return seconds if seconds >= 0 else None
 
 
-def compute_backoff(attempt, retry_after=None, rng=random.uniform,
-                    backoff_base=0.5, backoff_max=8.0):
+def compute_backoff(attempt, retry_after=None, rng=random.uniform, *,
+                    backoff_base, backoff_max):
     if retry_after is not None:
         return min(retry_after, backoff_max)
     delay = backoff_base * (2 ** attempt) + rng(0, backoff_base)
@@ -57,7 +57,8 @@ class SendResult:
 
     body() returns bytes when sent with stream=False, or a chunk iterator
     when stream=True; either way the underlying response is closed exactly
-    once, after the body is consumed.
+    once, after the body is consumed. body() is single-shot: consuming a
+    streamed result twice re-enters an already-closed response and raises.
     """
     status_code: int
     header_pairs: list
@@ -84,7 +85,7 @@ class SendResult:
 
 @dataclass
 class AllNodesFailed:
-    last_error: str
+    last_error: str | None
 
 
 class FailoverTransport:
@@ -111,7 +112,7 @@ class FailoverTransport:
 
     def send(self, method, url, headers, payload=b"", cookies=None,
              stream=False):
-        last_error = "no attempt was made (max_retries is 0)"
+        last_error = None
         for attempt in range(self.max_retries):
             node = self.selector.select()
 

@@ -55,7 +55,7 @@ class FakeSession:
         return item
 
     @property
-    def exhausted(self):
+    def call_count(self):
         return len(self.calls)
 
 
@@ -136,7 +136,7 @@ def test_exhaustion_reports_all_nodes_failed_with_backoff_sequence(rotator):
 
     assert isinstance(result, failover.AllNodesFailed)
     assert result.last_error == "Upstream error: 502"
-    assert session.exhausted == 3
+    assert session.call_count == 3
     # Pacing: backoff after attempts 0 and 1, none after the final attempt.
     assert sleeper.sleeps == [pytest.approx(0.625), pytest.approx(1.125)]  # 0.5·2ⁿ + 0.125
 
@@ -165,7 +165,7 @@ def test_non_retry_status_passes_through_without_retrying(rotator):
 
     assert isinstance(result, failover.SendResult)
     assert result.status_code == 401
-    assert session.exhausted == 1
+    assert session.call_count == 1
     assert sleeper.sleeps == []
     assert ("Content-Type", "application/json") in result.header_pairs
 
