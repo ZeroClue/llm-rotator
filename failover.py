@@ -100,6 +100,7 @@ class SendResult:
 @dataclass
 class AllNodesFailed:
     last_error: str | None
+    attempts: int = 0
 
 
 class FailoverTransport:
@@ -113,7 +114,7 @@ class FailoverTransport:
 
     def __init__(self, selector, ledger, session=None, sleep=time.sleep,
                  rng=random.uniform, max_retries=4, timeout=25.0,
-                 backoff_base=0.5, backoff_max=8.0):
+                 backoff_base=0.5, backoff_max=8.0, retry_posts=True):
         self.selector = selector
         self.ledger = ledger
         if session is not None:
@@ -128,11 +129,19 @@ class FailoverTransport:
         self.timeout = timeout
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
+        # POSTs are not idempotent: a 504/timeout may mean the upstream
+        # completed, and verbatim retries then double-bill. retry_posts=False
+        # gives POSTs exactly one attempt; the ledger still records the
+        # outcome so cooldown accounting stays truthful.
+        self.retry_posts = retry_posts
 
     def send(self, method, url, headers, payload=b"", stream=False):
         last_error = None
+        attempts = 0
+        single_shot_post = method.upper() == "POST" and not self.retry_posts
         for attempt in range(self.max_retries):
             node = self.selector.select()
+            attempts += 1
 
             request_headers = {
                 k: v for k, v in headers.items()
@@ -147,6 +156,9 @@ class FailoverTransport:
             )
 
             retry_after = None
+            failed = False
+            next_action = ("not retrying: RETRY_POSTS=false" if single_shot_post
+                           else "Retrying...")
             try:
                 response = self.session.request(
                     method=method,
@@ -158,27 +170,31 @@ class FailoverTransport:
                     stream=stream,
                 )
             except Timeout as e:
-                logger.error(f"Timeout on Node {node.node_id}: {str(e)}. Retrying...")
+                logger.error(f"Timeout on Node {node.node_id}: {str(e)}. {next_action}")
                 last_error = f"Timeout: {str(e)}"
                 self.ledger.record_failure(node)
+                failed = True
             except ConnectionError as e:
-                logger.error(f"Connection error on Node {node.node_id}: {str(e)}. Retrying...")
+                logger.error(f"Connection error on Node {node.node_id}: {str(e)}. {next_action}")
                 last_error = f"Connection error: {str(e)}"
                 self.ledger.record_failure(node)
+                failed = True
             except RequestException as e:
-                logger.error(f"Request failed on Node {node.node_id}: {str(e)}. Retrying...")
+                logger.error(f"Request failed on Node {node.node_id}: {str(e)}. {next_action}")
                 last_error = f"Request error: {str(e)}"
                 self.ledger.record_failure(node)
+                failed = True
             else:
                 if response.status_code in RETRY_STATUSES:
                     logger.warning(
                         f"Node {node.node_id} returned HTTP {response.status_code}. "
-                        f"Retrying with next node..."
+                        f"{next_action}"
                     )
                     last_error = f"Upstream error: {response.status_code}"
                     retry_after = parse_retry_after(response.headers.get("Retry-After"))
                     response.close()
                     self.ledger.record_failure(node)
+                    failed = True
                 else:
                     self.ledger.record_success(node)
                     return SendResult(
@@ -192,6 +208,9 @@ class FailoverTransport:
                         _streamed=stream,
                     )
 
+            if single_shot_post and failed:
+                return AllNodesFailed(last_error=last_error, attempts=attempts)
+
             if attempt < self.max_retries - 1:
                 self.sleep(compute_backoff(
                     attempt,
@@ -201,4 +220,4 @@ class FailoverTransport:
                     backoff_max=self.backoff_max,
                 ))
 
-        return AllNodesFailed(last_error=last_error)
+        return AllNodesFailed(last_error=last_error, attempts=attempts)

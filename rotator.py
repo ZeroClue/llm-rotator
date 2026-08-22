@@ -64,6 +64,13 @@ RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "0.5"))
 RETRY_BACKOFF_MAX = float(os.getenv("RETRY_BACKOFF_MAX", "8.0"))
 NODE_COOLDOWN_BASE = float(os.getenv("NODE_COOLDOWN_BASE", "2.0"))
 NODE_COOLDOWN_MAX = float(os.getenv("NODE_COOLDOWN_MAX", "60.0"))
+# POSTs are retried verbatim on failover; a 504/timeout may mean the upstream
+# completed, so duplicate-averse operators can set RETRY_POSTS=false.
+RETRY_POSTS = os.getenv("RETRY_POSTS", "true").strip().lower() == "true"
+
+
+def _env_bool(raw):
+    return raw.strip().lower() == "true"
 
 # Token-optimization settings live in OptimizationConfig.from_env() — parsed
 # in exactly one place, next to the pipeline class below.
@@ -285,6 +292,7 @@ transport = FailoverTransport(
     timeout=REQUEST_TIMEOUT,
     backoff_base=RETRY_BACKOFF_BASE,
     backoff_max=RETRY_BACKOFF_MAX,
+    retry_posts=RETRY_POSTS,
 )
 
 
@@ -296,10 +304,6 @@ _PROVIDER_PROFILES = {
     "anthropic": {"max_context": 200000, "reserved_tokens": 8192},
     "groq": {"max_context": 32000, "reserved_tokens": 2048},
 }
-
-
-def _env_bool(raw):
-    return raw.lower() == "true"
 
 
 def _env_prompt_cache_bool(raw):
@@ -985,7 +989,10 @@ def dynamic_failover_proxy(path):
     )
 
     if isinstance(result, AllNodesFailed):
-        logger.critical(f"All {MAX_RETRIES} proxy nodes failed. Last error: {result.last_error}")
+        logger.critical(
+            f"All retry attempts exhausted ({result.attempts} attempt(s), "
+            f"MAX_RETRIES={MAX_RETRIES}). Last error: {result.last_error}"
+        )
         return Response(
             json.dumps({
                 "error": {
