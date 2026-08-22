@@ -21,6 +21,7 @@ FINDINGS.md
 # --- Agent tooling (installed artifacts & local state; lockfile is tracked) ---
 .agents/
 .claude/
+.codegraph/
 
 # --- OS junk ---
 .DS_Store
