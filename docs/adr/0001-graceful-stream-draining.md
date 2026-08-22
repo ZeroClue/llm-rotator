@@ -30,12 +30,17 @@ proxy with a well-formed terminal SSE event (OpenAI-style error object +
   that race.
 - The guard lives in the view layer (rotator.py), not failover.py: the
   transport knows nothing about SSE framing.
-- One global deadline is fixed at arm time; streams starting after arming get
-  the terminal event immediately.
+- One global deadline is fixed at arm time and binds every stream equally:
+  one started inside the window runs until the deadline (then gets the
+  terminal event like everyone else); one started past it is cut on its
+  first chunk.
 - Arming uses chained SIGTERM/SIGINT handlers installed in `create_app()`:
   gunicorn 26.1.0 never fires its `worker_int` hook on SIGTERM (verified in
   the pinned source; only SIGINT/SIGQUIT reach it), and `init_signals` runs
   before app load, so handlers installed by the factory are the ones that
-  survive.
+  survive. The bare-server branch (drain-wait-then-exit) triggers only when
+  the previous handler is the OS/Python default — a supervisor that installs
+  its own TERM handler without graceful-stop machinery would get draining
+  armed but no orchestrated exit.
 
 Design record: issue #30 (grill session 2026-08-22).

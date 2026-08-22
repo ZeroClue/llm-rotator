@@ -69,6 +69,23 @@ class TestGuardedStream:
         assert list(guarded_stream(chunks, state=state)) == [TERMINAL_SSE_EVENT]
         assert chunks.closed
 
+    def test_stream_started_inside_window_runs_until_the_deadline(self):
+        """Post-arm start inside the window is finish-first like everyone
+        else: it pumps until the global deadline, then gets the terminal
+        event. Only a start past the deadline cuts immediately."""
+        clock = FakeClock(now=100.0)
+        state = ShutdownState(clock=clock)
+        state.arm(20.0)
+        clock.now = 105.0  # armed 5s ago; 15s of window left
+
+        def starts_mid_window():
+            yield b"early chunk"
+            clock.now = 120.0
+            yield b"never reached"
+
+        out = list(guarded_stream(starts_mid_window(), state=state))
+        assert out == [b"early chunk", TERMINAL_SSE_EVENT]
+
     def test_closing_guard_early_closes_inner(self):
         state = ShutdownState(clock=FakeClock())
         chunks = FakeChunks([b"a", b"b"])

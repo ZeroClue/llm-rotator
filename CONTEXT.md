@@ -58,8 +58,8 @@ than rejecting the request.
 
 **Draining**:
 The state after a shutdown signal: in-flight streams keep flowing until the
-drain window elapses, then each is ended with a terminal SSE event. New work
-is not started meaningfully once draining.
+drain window elapses, then each is ended with a terminal SSE event. The
+window binds every stream equally, whatever its start time.
 
 **Drain window**:
 The bounded period after a shutdown signal during which in-flight streams may

@@ -72,6 +72,17 @@ def slow_mock():
     upstream.stop()
 
 
+def _wait_healthy(proc, base, attempts=60):
+    for _ in range(attempts):
+        try:
+            if requests.get(f"{base}/health", timeout=1).status_code == 200:
+                return
+        except Exception:
+            time.sleep(0.25)
+    proc.terminate()
+    raise RuntimeError(f"server at {base} did not become healthy")
+
+
 def _spawn_gunicorn(upstream, drain_window, graceful_timeout):
     bind_port = _free_port()
     env = _scrubbed_env()
@@ -91,14 +102,8 @@ def _spawn_gunicorn(upstream, drain_window, graceful_timeout):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     base = f"http://127.0.0.1:{bind_port}"
-    for _ in range(60):
-        try:
-            if requests.get(f"{base}/health", timeout=1).status_code == 200:
-                return proc, base
-        except Exception:
-            time.sleep(0.25)
-    proc.terminate()
-    raise RuntimeError("gunicorn did not become healthy")
+    _wait_healthy(proc, base)
+    return proc, base
 
 
 def _stop(proc, timeout):
@@ -178,14 +183,7 @@ def test_bare_dev_server_survives_sigterm_and_delivers_terminal_event(slow_mock)
     )
     base = f"http://127.0.0.1:{bind_port}"
     try:
-        for _ in range(60):
-            try:
-                if requests.get(f"{base}/health", timeout=1).status_code == 200:
-                    break
-            except Exception:
-                time.sleep(0.25)
-        else:
-            raise RuntimeError("dev server did not become healthy")
+        _wait_healthy(proc, base)
 
         arrivals = []
         reader = _stream_in_thread(base, arrivals)
