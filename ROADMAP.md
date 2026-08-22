@@ -55,11 +55,16 @@ failure→cooldown→skip→expiry covered deterministically via a stepped virtu
 
 ## Next (real work, plan before starting)
 
-### 4. Graceful stream draining — `todo`
+### 4. Graceful stream draining — `in progress` (2026-08-22, issue #30)
 On SIGTERM/gunicorn graceful shutdown, in-flight SSE completions are cut at
 `graceful_timeout`. Options: short `Retry-After`-style SSE error event before cut,
 or hold shutdown until streams finish with a bounded drain window env var
 (`GUNICORN_GRACEFUL_TIMEOUT` already plumbed).
+Amendment (design settled 2026-08-22, issue #30): finish-first draining —
+streams pump until natural completion or `STREAM_DRAIN_WINDOW` (default 20s,
+kept below graceful_timeout), then end with a terminal SSE event (OpenAI-style
+error + `[DONE]`). Armed via gunicorn `worker_int` hook; dev server gets parity
+via chained signal handlers. Guard lives in the view layer; ADR 0001.
 *Acceptance:* integration test: start stream, SIGTERM master, client either receives
 the full body within the drain window or a well-formed terminal SSE event.
 
