@@ -362,6 +362,15 @@ def test_models_endpoint_requires_token_too(rotator, monkeypatch, client):
     assert client.get("/v1/models").status_code == 401
 
 
+def test_models_endpoint_fails_over_to_healthy_node(mock, client):
+    resp = client.get("/v1/models")
+    assert resp.status_code == 200
+    assert resp.get_json()["data"][0]["id"] == "gpt-4o"
+    gets = [r for r in mock.captured() if r["method"] == "GET"]
+    assert gets and gets[-1]["path"].endswith("/models")
+    assert gets[-1]["auth"] == "Bearer node-two-key"
+
+
 def test_health_reports_available_node_count(client):
     resp = client.get("/health")
     body = resp.get_json()

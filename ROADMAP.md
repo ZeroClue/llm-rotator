@@ -92,12 +92,17 @@ names, Python 3.8+ support. Rewrite against actual code; keep AGENTS.md as the
 agent-facing source of truth and link both.
 *Acceptance:* every env var/endpoint in README greps clean against `rotator.py`.
 
-### 14. Extract failover transport from the proxy view — `todo`
+### 14. Extract failover transport from the proxy view — `done` (2026-08-22)
 Give retry/failover its own module behind a send-result interface: node pick, key
 injection, proxy mapping, status classification (429/5xx), Retry-After parsing,
 backoff, cooldown reporting, header hygiene, and the streaming generator all sit
 behind one seam; the `/v1/*` view and `list_models` become thin callers
 (requests session = production adapter, scripted fake = test adapter).
+Amendment: landed as `failover.py` (`FailoverTransport.send()` →
+`SendResult | AllNodesFailed`, framework-free); `list_models` inherited full
+failover + header hygiene (its hardcoded `timeout=10` unified to
+`REQUEST_TIMEOUT`); sleeper injection from #13 landed here. Design record:
+issue #10 comment, 2026-08-22.
 *Rationale:* the deletion test already failed in production — `list_models`
 (rotator.py:1037–1054) re-implemented node pick/key/proxies shallowly with a
 hardcoded `timeout=10` and leaked hop-by-hop headers; meanwhile every new feature

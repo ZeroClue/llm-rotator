@@ -20,12 +20,12 @@ import re
 import hmac
 import json
 import time
-import random
 import logging
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
+
 from flask import Flask, request, Response, jsonify, stream_with_context
 from werkzeug.exceptions import HTTPException
 
@@ -54,10 +54,6 @@ try:
 except ImportError:
     LLMLINGUA_AVAILABLE = False
     logger.warning("llmlingua not installed. Advanced semantic compression disabled. Install with: pip install llmlingua")
-
-import requests
-from requests import Session
-from requests.exceptions import RequestException, Timeout, ConnectionError
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration via Environment Variables
@@ -168,9 +164,8 @@ except Exception as e:
     raise SystemExit(1)
 
 
-# Initialize Flask app and session
+# Initialize Flask app; the upstream HTTP session lives inside the transport.
 app = Flask(__name__)
-session = Session()
 
 # Optional bearer-token gate. Empty disables auth entirely (current behavior
 # for existing deployments). /health and /ready stay open either way so
@@ -1044,22 +1039,16 @@ def ready_check():
 
 @app.route('/v1/models', methods=['GET'])
 def list_models():
-    """Proxy model listing endpoint."""
-    node = node_selector.select()
-    headers = {"Authorization": f"Bearer {node.api_key}"}
-    proxies = {"http": node.proxy, "https": node.proxy}
-    
-    try:
-        response = session.get(
-            url=f"{TARGET_PROVIDER_URL}/models",
-            headers=headers,
-            proxies=proxies,
-            timeout=10
-        )
-        return Response(response.content, response.status_code, response.headers.items())
-    except RequestException as e:
-        logger.error(f"Failed to fetch models: {e}")
+    """Proxy model listing endpoint (full failover via the transport)."""
+    result = transport.send(
+        method="GET",
+        url=f"{TARGET_PROVIDER_URL}/models",
+        headers={},
+    )
+    if isinstance(result, AllNodesFailed):
+        logger.error(f"Failed to fetch models: {result.last_error}")
         return jsonify({"error": "Failed to fetch models from upstream"}), 502
+    return Response(result.body(), result.status_code, result.header_pairs)
 
 
 @app.errorhandler(Exception)
