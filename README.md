@@ -1,89 +1,63 @@
-# Secure Tailscale LLM Proxy Rotator
+# Tailscale LLM Rotator
 
-An intelligent API gateway for local AI coding agents that distributes LLM requests across multiple Tailscale nodes with automatic failover, key injection, and **state-of-the-art token optimization**.
+A Flask reverse proxy that rotates OpenAI-compatible LLM requests across multiple
+Tailscale egress nodes: thread-safe round-robin selection, per-node API-key
+injection, automatic failover on 429/5xx/timeouts with backoff and per-node
+cooldowns, plus an optional token-compression pipeline for `/v1/chat/completions`.
 
-## 🚀 Features
+> **Agent-facing docs:** [`AGENTS.md`](AGENTS.md) is the source of truth for
+> code layout, gotchas, testing, and deployment quirks. This README is the
+> human-facing overview; if the two disagree, trust `rotator.py`/`failover.py`.
 
-### Core Capabilities
-- **Dynamic Key Injection**: Automatically injects the correct API key matched to the selected egress Tailscale node
-- **Resilient Failover**: Seamlessly retries failed requests (429, 5xx, timeouts) on the next available node
-- **Environment Configuration**: No hardcoded secrets - all configuration via environment variables
-- **DNS Leak Prevention**: Uses `socks5h://` protocol to ensure DNS resolution happens on remote nodes
-- **Thread-Safe Rotation**: Atomic round-robin node selection for concurrent requests
-- **Streaming Support**: Full support for streaming chat completions with fast-path bypass
+## How it works
 
-### Advanced Token Optimization Pipeline 🔥
+- **Nodes** — each entry in your node pool pairs one egress (a Tailscale SOCKS5
+  endpoint) with the API key to spend through it. Nodes are numbered contiguously
+  from 1 (`PROXY_1_URL`/`API_KEY_1`, `PROXY_2_URL`/`API_KEY_2`, ...).
+- **Rotation** — requests advance a round-robin cursor across usable nodes.
+- **Failover** — on 429/500/502/503/504, timeouts, or connection errors, the
+  request retries on the next usable node with exponential backoff, honoring
+  `Retry-After`. Failed nodes enter an exponentially growing cooldown; if every
+  node is cooling, rotation serves the cursor node anyway (never-starve).
+- **Optimization** — chat/completions payloads can pass through a six-stage
+  compression pipeline (dedup → whitespace → semantic compression → prompt
+  caching → importance filtering → summarization/truncation), pure
+  payload-in/payload-out, never breaking the proxied request.
 
-A modular 6-stage compression pipeline that maximizes context utilization and minimizes token waste:
+## Prerequisites
 
-1. **Structural Hygiene** - Remove duplicate messages, strip excessive whitespace
-2. **Semantic Compression** - LLMLingua-powered meaning preservation (optional)
-3. **Prompt Caching** - Leverage OpenAI/Anthropic cache control headers
-4. **Importance Scoring** - Keep high-value messages, drop low-value content
-5. **Recursive Summarization** - Auto-summarize old context when approaching limits
-6. **Smart Truncation** - Aggressive fallback with post-optimization verification
-
-**All stages independently toggleable** via environment variables for granular control.
-
-### Performance Optimizations
-- **LRU Context Caching**: 128-entry cache for repeated context blocks (instant reuse)
-- **Provider Profiles**: Pre-configured settings for OpenAI (128K), Anthropic (200K), Groq (32K)
-- **Streaming Fast-Path**: Bypass expensive optimizations for real-time responses
-- **Post-Verification**: Guaranteed token limit compliance after optimization
-
-## 📋 Prerequisites
-
-- Python 3.8+
-- Tailscale installed and authenticated
-- Four (or more) Tailscale nodes running SOCKS5 proxies
+- Python **3.10+**
+- [Tailscale](https://tailscale.com) installed and authenticated
+- One or more Tailscale nodes running SOCKS5 proxies
 - API keys for each node's LLM provider account
 
-## 🔧 Installation
+## Installation
 
-### Option A: Direct Installation
+### Option A: Direct
 
-1. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+pip install -r requirements.txt   # flask, gunicorn, requests, tiktoken
+cp .env.example .env              # then edit with real values
+python rotator.py                 # binds PROXY_BIND_HOST:PROXY_BIND_PORT
+```
 
-2. **Configure environment variables:**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your actual values
-   ```
+Production runs use gunicorn:
 
-3. **Required environment variables:**
-   ```bash
-   # Node configuration (add as many as needed)
-   PROXY_1_URL=socks5h://100.64.0.1:1055
-   API_KEY_1=sk-proj-your-actual-key-1
-   
-   PROXY_2_URL=socks5h://100.64.0.2:1055
-   API_KEY_2=sk-proj-your-actual-key-2
-   
-   # ... add more nodes as needed
-   ```
+```bash
+gunicorn -c gunicorn.conf.py rotator:app
+```
 
-### Option B: Docker Deployment 🐳
+### Option B: Docker Compose
 
-1. **Build and run with docker-compose:**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your actual values
-   
-   docker-compose up -d --build
-   ```
+```bash
+cp .env.example .env    # edit with real values
+docker-compose up -d --build
+```
 
-2. **Verify container is running:**
-   ```bash
-   docker-compose ps
-   docker-compose logs -f llm-rotator
-   ```
+Docker uses `network_mode: host` — Tailscale's 100.64.x.x addresses aren't
+reachable through bridge networking.
 
-**Note:** Docker uses `network_mode: host` to access Tailscale's 100.64.x.x addresses directly.
-
-### Option C: Manual Docker Build
+### Option C: Manual Docker
 
 ```bash
 docker build -t llm-rotator .
@@ -95,424 +69,157 @@ docker run -d \
   llm-rotator
 ```
 
-## 🎯 Token Optimization Configuration
+## Endpoints
 
-### Quick Start (Recommended Defaults)
+| Endpoint | Methods | Description |
+|----------|---------|-------------|
+| `/v1/<path>` | GET, POST, PUT, DELETE, PATCH | Proxied upstream call with rotation + failover |
+| `/v1/models` | GET | Model listing with full failover |
+| `/health` | GET | Process health + per-node status (stays open when auth is on) |
+| `/ready` | GET | Readiness: 503 while every node is in cooldown |
 
-```bash
-# Enable the full optimization pipeline
-ENABLE_CONTEXT_COMPRESSION=true
+Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`.
 
-# Provider-specific presets (automatically configured)
-PROVIDER_PROFILE=openai  # Options: openai, anthropic, groq
-
-# Fine-tune individual stages
-ENABLE_STRUCTURAL_HYGIENE=true
-ENABLE_SEMANTIC_COMPRESSION=false  # Requires llmlingua
-ENABLE_PROMPT_CACHING=true
-ENABLE_IMPORTANCE_SCORING=true
-ENABLE_RECURSIVE_SUMMARIZATION=false
-ENABLE_SMART_TRUNCATION=true
-
-# Performance features
-ENABLE_STREAMING_FASTPATH=true
-ENABLE_CONTEXT_CACHE=true
-CONTEXT_CACHE_SIZE=128
-```
-
-### Advanced Configuration
-
-```bash
-# Token budget management
-MAX_CONTEXT_TOKENS=120000        # Adjust based on your model
-RESERVED_RESPONSE_TOKENS=4000    # Space for model output
-COMPRESSION_THRESHOLD=0.85       # Compress when >85% full
-
-# Structural hygiene settings
-REMOVE_DUPLICATE_MESSAGES=true
-STRIP_WHITESPACE=true
-MIN_MESSAGE_LENGTH=10            # Ignore very short messages
-
-# Semantic compression (requires llmlingua)
-LLMLINGUA_TARGET_RATIO=0.5       # Compress to 50% of original
-LLMLINGUA_FORCE_TOKENS=200       # Minimum tokens after compression
-
-# Importance scoring
-IMPORTANCE_KEYWORDS="error,fix,bug,critical,important"
-SYSTEM_PROMPT_WEIGHT=2.0         # Weight for system messages
-RECENT_MESSAGES_WEIGHT=1.5       # Weight for recent context
-
-# Recursive summarization
-ENABLE_SUMMARIZATION=false       # CPU-intensive, enable with caution
-SUMMARIZATION_MODEL=gpt-4o-mini  # Use cheaper model for summarization
-MAX_SUMMARY_TOKENS=500           # Max tokens per summary
-
-# Streaming optimization
-STREAMING_CHUNK_SIZE=1000        # Process in chunks for large contexts
-```
-
-### Provider Profiles (Automatic Configuration)
-
-| Provider | Max Context | Reserved | Cache Support | Profile Name |
-|----------|-------------|----------|---------------|--------------|
-| OpenAI   | 128,000     | 4,000    | Yes           | `openai`     |
-| Anthropic| 200,000     | 8,000    | Yes           | `anthropic`  |
-| Groq     | 32,000      | 2,000    | No            | `groq`       |
-
-Set `PROVIDER_PROFILE=<name>` to automatically configure optimal settings.
-
-## 🏃 Running the Proxy
-
-### Direct Execution
-```bash
-python rotator.py
-```
-
-### With systemd (Linux)
-```bash
-sudo cp llm-rotator.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable llm-rotator
-sudo systemctl start llm-rotator
-sudo systemctl status llm-rotator
-```
-
-### With Docker Compose
-```bash
-docker-compose up -d
-docker-compose logs -f
-```
-
-### With launchd (macOS)
-Create `/Library/LaunchDaemons/com.llmrotator.plist`:
-```xml
-<key>ProgramArguments</key>
-<array>
-    <string>/usr/bin/python3</string>
-    <string>/path/to/rotator.py</string>
-</array>
-```
-
-## 📡 Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/chat/completions` | POST | Main chat completion endpoint with optimization |
-| `/v1/models` | GET | List available models |
-| `/health` | GET | Health check with optimization status |
-| `/health/detailed` | GET | Detailed health with node status and cache info |
-
-### Health Check Response Example
+### `/health` response shape
 
 ```json
 {
   "status": "healthy",
-  "nodes_configured": 4,
-  "current_node_index": 2,
+  "nodes_configured": 2,
+  "nodes_available": 1,
+  "current_node_index": 1,
+  "nodes": [
+    {"node_id": 1, "proxy": "socks5h://100.64.0.1:1055", "consecutive_failures": 3, "cooldown_seconds": 14.5},
+    {"node_id": 2, "proxy": "socks5h://100.64.0.2:1055", "consecutive_failures": 0, "cooldown_seconds": 0.0}
+  ],
   "token_optimization_enabled": true,
-  "optimization_stages": {
-    "structural_hygiene": true,
-    "semantic_compression": false,
-    "prompt_caching": true,
-    "importance_scoring": true,
-    "recursive_summarization": false,
-    "smart_truncation": true
-  },
-  "provider_profile": "openai",
-  "max_context_tokens": 120000,
-  "reserved_response_tokens": 4000,
-  "context_cache_enabled": true,
-  "context_cache_size": 128,
-  "context_cache_hits": 47,
-  "context_cache_misses": 203,
-  "dependencies": {
-    "tiktoken": true,
-    "llmlingua": false
-  }
+  "max_context_tokens": 128000,
+  "reserved_response_tokens": 4096
 }
 ```
 
-## 🔒 Security
+## Configuration
 
-### Tailscale ACL Configuration
+All configuration is environment variables; `.env.example` matches the code.
+Node vars must be contiguous from 1 — the loader stops at the first missing
+index and silently drops later nodes.
 
-Add this to your Tailscale Admin Console ACL JSON:
-
-```json
-{
-  "tags": {
-    "tag:llm-client": ["admin@yourdomain.com"],
-    "tag:proxy-nodes": ["admin@yourdomain.com"]
-  },
-  "acls": [
-    {
-      "action": "accept",
-      "src": ["tag:llm-client"],
-      "dst": ["tag:proxy-nodes:1055"]
-    }
-  ]
-}
-```
-
-### On Proxy Nodes
-
-```bash
-tailscaled --socks5-server=0.0.0.0:1055
-```
-
-### Best Practices
-
-1. **Localhost Binding**: The proxy binds to `127.0.0.1` by default (change with `BIND_HOST`)
-2. **No Secret Logging**: API keys are never logged (only prefixes shown)
-3. **Environment Variables**: Store secrets in `.env` file (gitignored)
-4. **Docker Security**: Runs as non-root user inside container
-
-## 📊 Monitoring & Observability
-
-### Health Checks
-
-```bash
-# Basic health
-curl http://127.0.0.1:8080/health
-
-# Detailed health with cache stats
-curl http://127.0.0.1:8080/health/detailed
-
-# Watch logs
-docker-compose logs -f llm-rotator
-```
-
-### Token Usage Logging
-
-The proxy logs optimization statistics for each request:
-
-```
-[INFO] Context optimized: 45,230 → 28,450 tokens (37.1% reduction)
-[INFO] Stage results: structural_hygiene=-2,100, semantic=-12,500, truncation=-2,180
-[INFO] Cache: HIT (reused compressed context)
-```
-
-### Metrics to Watch
-
-- **Cache Hit Rate**: Target >30% for repeated conversations
-- **Compression Ratio**: Typical 30-60% reduction with full pipeline
-- **Failover Frequency**: Should be rare; indicates rate limiting or node issues
-- **Average Latency**: Streaming fast-path should add <50ms overhead
-
-## 🔧 IDE Integration
-
-### Continue.dev / OpenCode
-
-```json
-{
-  "models": [{
-    "title": "Tailscale Rotated LLM Pool",
-    "provider": "openai",
-    "model": "gpt-4o",
-    "apiBase": "http://127.0.0.1:8080/v1",
-    "apiKey": "managed-by-local-rotator-daemon"
-  }]
-}
-```
-
-### Cursor
-
-Settings → AI → Custom API Endpoint:
-- Base URL: `http://127.0.0.1:8080/v1`
-- API Key: `any-value` (injected by proxy)
-
-### VS Code Extensions
-
-Any extension supporting OpenAI-compatible APIs works with:
-- Endpoint: `http://127.0.0.1:8080/v1`
-- Model: Any supported by your upstream providers
-
-## 📝 Environment Variables Reference
-
-### Core Configuration
+### Core
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BIND_HOST` | `127.0.0.1` | Host to bind the proxy server |
-| `BIND_PORT` | `8080` | Port to bind the proxy server |
-| `LLM_PROVIDER_URL` | `https://api.openai.com/v1` | Target LLM provider API URL |
-| `REQUEST_TIMEOUT` | `25.0` | Request timeout in seconds |
-| `MAX_RETRIES` | `4` | Maximum retry attempts across nodes |
-| `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
+| `PROXY_BIND_HOST` | `127.0.0.1` | Bind host. Read by both servers, but their unset-fallbacks differ: `python rotator.py` falls back to loopback, gunicorn to `0.0.0.0` — set this var explicitly in production (drift tracked by roadmap #15) |
+| `PROXY_BIND_PORT` | `8080` | Bind port |
+| `LLM_PROVIDER_URL` | `https://api.openai.com/v1` | Upstream provider base URL |
+| `MAX_RETRIES` | `4` | Attempts across nodes per request |
+| `REQUEST_TIMEOUT` | `25.0` | Per-attempt upstream timeout (seconds) |
+| `RETRY_BACKOFF_BASE` | `0.5` | Failover backoff base (seconds) |
+| `RETRY_BACKOFF_MAX` | `8.0` | Failover backoff cap (seconds); a `Retry-After` header overrides up to this cap |
+| `NODE_COOLDOWN_BASE` | `2.0` | First-failure cooldown (seconds); doubles per consecutive failure |
+| `NODE_COOLDOWN_MAX` | `60.0` | Cooldown cap (seconds) |
+| `RETRY_POSTS` | `true` | `false` gives POSTs exactly one attempt — a 504/timeout may mean the upstream completed, so verbatim retries can double-bill |
+| `DEFAULT_MODEL` | `gpt-4o` | Model used for token counting |
+| `LOG_LEVEL` | `INFO` | Logging level |
+| `PROXY_AUTH_TOKEN` | *(empty)* | Optional bearer gate: when set, `/v1/*` requires `Authorization: Bearer <token>` (401 otherwise). `/health` and `/ready` stay open |
 
-### Node Configuration (Repeat for Each Node)
+### Nodes (repeat contiguously from 1)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `PROXY_N_URL` | ✅ | SOCKS5 proxy URL (e.g., `socks5h://100.64.0.1:1055`) |
-| `API_KEY_N` | ✅ | API key for node N's LLM account |
+| `PROXY_N_URL` | ✅ | Egress URL, e.g. `socks5h://100.64.0.1:1055` (`socks5h` = DNS resolved remotely) |
+| `API_KEY_N` | ✅ | API key injected as `Authorization: Bearer …` for node N |
 
-Example:
-```bash
-PROXY_1_URL=socks5h://100.64.0.1:1055
-API_KEY_1=sk-proj-xxxxx
-
-PROXY_2_URL=socks5h://100.64.0.2:1055
-API_KEY_2=sk-proj-yyyyy
-
-PROXY_3_URL=socks5h://100.64.0.3:1055
-API_KEY_3=sk-proj-zzzzz
-```
-
-### Token Optimization Pipeline
+### Gunicorn (`gunicorn.conf.py`)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ENABLE_CONTEXT_COMPRESSION` | `true` | Master switch for all optimizations |
-| `PROVIDER_PROFILE` | `openai` | Preset: openai, anthropic, groq |
-| `MAX_CONTEXT_TOKENS` | `120000` | Maximum context window size |
-| `RESERVED_RESPONSE_TOKENS` | `4000` | Tokens reserved for model response |
-| `COMPRESSION_THRESHOLD` | `0.85` | Compress when context >85% full |
+| `GUNICORN_WORKERS` | `1` | Worker processes |
+| `GUNICORN_THREADS` | `8` | Threads per worker |
+| `GUNICORN_TIMEOUT` | `60` | Worker timeout (seconds) |
+| `GUNICORN_GRACEFUL_TIMEOUT` | `30` | Graceful shutdown window (seconds) |
 
-#### Stage-Specific Toggles
+### Optimization pipeline (`OptimizationConfig`)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ENABLE_STRUCTURAL_HYGIENE` | `true` | Remove duplicates, strip whitespace |
-| `ENABLE_SEMANTIC_COMPRESSION` | `false` | LLMLingua-powered compression |
-| `ENABLE_PROMPT_CACHING` | `true` | Use provider cache headers |
-| `ENABLE_IMPORTANCE_SCORING` | `true` | Prioritize important messages |
-| `ENABLE_RECURSIVE_SUMMARIZATION` | `false` | Auto-summarize old context |
-| `ENABLE_SMART_TRUNCATION` | `true` | Drop oldest messages when needed |
-
-#### Performance Features
+Provider profiles preset the context budget; explicit env vars win over profile
+defaults.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ENABLE_STREAMING_FASTPATH` | `true` | Skip optimization for streaming |
-| `ENABLE_CONTEXT_CACHE` | `true` | Cache compressed contexts |
-| `CONTEXT_CACHE_SIZE` | `128` | Number of cached contexts |
+| `ENABLE_CONTEXT_COMPRESSION` | `true` | Master switch |
+| `PROVIDER_PROFILE` | `openai` | Budget presets: `openai` (128k/4k), `anthropic` (200k/8k), `groq` (32k/2k) |
+| `MAX_CONTEXT_TOKENS` | profile | Context ceiling for optimization decisions |
+| `RESERVED_RESPONSE_TOKENS` | profile | Tokens reserved for the model's reply |
+| `COMPRESSION_THRESHOLD` | `0.85` | Summarize/truncate when context exceeds this fraction of budget |
+| `REMOVE_DUPLICATE_MESSAGES` | `true` | Collapse consecutive duplicate messages |
+| `STRIP_WHITESPACE` | `true` | Normalize whitespace runs |
+| `ENABLE_STREAMING_FASTPATH` | `true` | Streaming requests skip expensive stages (hygiene only) |
+| `ENABLE_SEMANTIC_COMPRESSION` | `false` | LLMLingua compression (optional dependency, pulls torch) |
+| `SEMANTIC_COMPRESSION_RATIO` | `0.5` | Target compression ratio |
+| `ENABLE_PROMPT_CACHING` | `false` | Anthropic-style `cache_control` markers — OpenAI rejects these; off unless explicitly enabled |
+| `ENABLE_IMPORTANCE_SCORING` | `false` | Score-and-filter messages by recency/length/role/keywords |
+| `MIN_MESSAGE_IMPORTANCE` | `0.3` | Filter threshold (system prompts always kept) |
+| `ENABLE_RECURSIVE_SUMMARIZATION` | `false` | Summarize older context near the budget |
+| `SUMMARIZATION_MODEL` | `gpt-4o-mini` | Reserved for summarization cost |
 
-#### Fine-Tuning Parameters
+Notes:
+- The pipeline is **pure** — input payloads are never mutated — and **never
+  breaks a proxied request**: on internal failure it logs and forwards the
+  payload unoptimized.
+- Client cookies are never forwarded upstream, and the proxy stores no
+  upstream cookies.
+- `max_tokens` may be clamped down to fit the remaining context budget
+  (logged when it happens).
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `REMOVE_DUPLICATE_MESSAGES` | `true` | Remove consecutive duplicates |
-| `STRIP_WHITESPACE` | `true` | Clean excessive whitespace |
-| `MIN_MESSAGE_LENGTH` | `10` | Ignore messages shorter than this |
-| `LLMLINGUA_TARGET_RATIO` | `0.5` | Compress to X% of original |
-| `LLMLINGUA_FORCE_TOKENS` | `200` | Minimum tokens after compression |
-| `IMPORTANCE_KEYWORDS` | See code | Comma-separated keywords |
-| `SYSTEM_PROMPT_WEIGHT` | `2.0` | Weight multiplier for system messages |
-| `RECENT_MESSAGES_WEIGHT` | `1.5` | Weight multiplier for recent messages |
-| `ENABLE_SUMMARIZATION` | `false` | Enable recursive summarization |
-| `SUMMARIZATION_MODEL` | `gpt-4o-mini` | Model for summarization |
-| `MAX_SUMMARY_TOKENS` | `500` | Max tokens per summary |
+## Security
 
-## ⚠️ Troubleshooting
+- The proxy spends every node's API key on behalf of anyone who can reach the
+  bind address. It binds loopback by default; set `PROXY_AUTH_TOKEN` before
+  ever exposing it, and prefer not to expose it at all.
+- Compose deliberately uses `network_mode: host` for Tailscale reachability —
+  mind what else listens on the host.
+- Secrets live in `.env` (gitignored); keys are injected per attempt and are
+  excluded from logs and `/health`.
+- The container runs as a non-root user.
 
-### All Nodes Failing
+## Troubleshooting
 
 ```bash
-# Verify Tailscale is running
-tailscale status
+# Is anything usable?
+curl -s http://127.0.0.1:8080/health | jq '{nodes_available, nodes}'
 
-# Check SOCKS5 proxy is listening
-netstat -tlnp | grep 1055
+# Orchestrator view
+curl -si http://127.0.0.1:8080/ready | head -1
 
-# Test connectivity to a node
-curl --socks5-hostname 100.64.0.1:1055 https://api.openai.com/v1/models
+# Watch failover/cooldown decisions
+LOG_LEVEL=DEBUG python rotator.py
 ```
 
-### Token Optimization Not Working
+- **All nodes failing**: `tailscale status`; check each SOCKS5 listener;
+  `curl --socks5-hostname 100.64.0.1:1055 https://api.openai.com/v1/models`.
+- **401s you didn't expect**: `PROXY_AUTH_TOKEN` is set — send
+  `Authorization: Bearer <token>`.
+- **Double-billed completions**: set `RETRY_POSTS=false` (see trade-off above).
+- **First start hangs on tokenizer download**: tiktoken fetches its BPE file
+  unless cached — the Docker image pre-bakes it via `TIKTOKEN_CACHE_DIR`;
+  bare-metal needs network or a warm cache.
+
+## Testing
 
 ```bash
-# Ensure tiktoken is installed
-pip install tiktoken
-
-# Check if optimization is enabled
-curl http://127.0.0.1:8080/health | jq .token_optimization_enabled
-
-# Review logs for optimization stats
-docker-compose logs llm-rotator | grep "Context optimized"
-```
-
-### Semantic Compression Issues
-
-```bash
-# Install llmlingua (optional but recommended)
-pip install llmlingua
-
-# Verify installation
-python -c "from llmlingua import PromptCompressor; print('OK')"
-
-# Check status in health endpoint
-curl http://127.0.0.1:8080/health | jq .dependencies.llmlingua
-```
-
-### High Latency with Optimization
-
-```bash
-# Enable streaming fast-path
-export ENABLE_STREAMING_FASTPATH=true
-
-# Disable expensive stages
-export ENABLE_SEMANTIC_COMPRESSION=false
-export ENABLE_RECURSIVE_SUMMARIZATION=false
-
-# Reduce cache size if memory-constrained
-export CONTEXT_CACHE_SIZE=64
-```
-
-### Cache Miss Rate Too High
-
-- Ensure conversations have consistent structure
-- Check if `CONTEXT_CACHE_SIZE` is too small
-- Verify content hashing isn't too sensitive (check logs)
-
-## 🧪 Testing
-
-### Unit Tests
-
-```bash
+pip install pytest
 python -m pytest tests/ -v
 ```
 
-### Integration Tests
+The suite is fully offline: node 1 is a dead port (exercising failover), node 2
+is a scripted mock upstream, and the transport/pipeline units run without HTTP
+or real sleeps.
 
-```bash
-# Test basic rotation
-curl http://127.0.0.1:8080/health
+## Contributing
 
-# Test chat completion
-curl -X POST http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4o",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
+1. Branch per ticket (`git checkout -b implement-<slug>`)
+2. Tests green at every commit (`pytest tests/`, `python -m py_compile rotator.py failover.py`)
+3. PR referencing the issue whose acceptance criteria the diff implements
 
-# Test optimization stats
-curl http://127.0.0.1:8080/health/detailed | jq .context_cache
-```
+## License
 
-## 📚 Additional Resources
-
-- [Tailscale Documentation](https://tailscale.com/docs)
-- [LLMLingua GitHub](https://github.com/microsoft/LLMLingua)
-- [OpenAI Token Guide](https://platform.openai.com/token-guidelines)
-- [Anthropic Prompt Caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching)
-
-## 🤝 Contributing
-
-1. Create a feature branch (`git checkout -b feature/amazing-feature`)
-2. Make your changes with tests
-3. Run the test suite (`pytest tests/`)
-4. Submit a pull request
-
-## 📄 License
-
-MIT License - see LICENSE file for details.
-
-## 🙏 Acknowledgments
-
-- [Caveman](https://github.com/semperos/caveman) for inspiration on context management
-- [LLMLingua](https://github.com/microsoft/LLMLingua) for semantic compression
-- [Tailscale](https://tailscale.com) for secure networking
-- The open-source community for continuous innovation in LLM efficiency
-
+MIT — see [LICENSE](LICENSE).
