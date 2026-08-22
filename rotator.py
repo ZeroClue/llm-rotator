@@ -19,6 +19,7 @@ import re
 import hmac
 import json
 import time
+import signal
 import logging
 import threading
 from dataclasses import dataclass, field, replace
@@ -71,6 +72,10 @@ class Settings:
     # POSTs are retried verbatim on failover; a 504/timeout may mean the upstream
     # completed, so duplicate-averse operators can set RETRY_POSTS=false.
     retry_posts: bool = True
+    # Graceful-shutdown drain window (seconds from the signal) for in-flight
+    # SSE streams; keep below GUNICORN_GRACEFUL_TIMEOUT so the terminal event
+    # flushes before gunicorn's hard kill. 0 cuts streams on the next chunk.
+    stream_drain_window: float = 20.0
     default_model: str = "gpt-4o"
     # Optional bearer-token gate. Empty disables auth entirely. /health and
     # /ready stay open either way so orchestrators can probe without the token.
@@ -90,6 +95,7 @@ class Settings:
             node_cooldown_base=float(os.getenv("NODE_COOLDOWN_BASE", "2.0")),
             node_cooldown_max=float(os.getenv("NODE_COOLDOWN_MAX", "60.0")),
             retry_posts=_env_bool(os.getenv("RETRY_POSTS", "true")),
+            stream_drain_window=float(os.getenv("STREAM_DRAIN_WINDOW", "20.0")),
             default_model=os.getenv("DEFAULT_MODEL", "gpt-4o"),
             auth_token=os.getenv("PROXY_AUTH_TOKEN", ""),
         )
@@ -140,6 +146,44 @@ def build_node_pool():
     logger.info(f"Node pool initialized with {len(pool)} nodes")
     return pool
 
+
+class ShutdownState:
+    """
+    Shutdown draining: armed once by the signal handlers when the process is
+    asked to stop; streams may finish naturally until the drain window
+    elapses, then each is cut with a terminal SSE event.
+
+    One global deadline is fixed at arm time — a stream starting after that
+    deadline is already past it and terminates immediately. Arming is
+    idempotent: the first signal wins.
+    """
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._deadline = None
+        self._inflight = 0
+        self._lock = threading.Lock()
+
+    def arm(self, grace_seconds):
+        if self._deadline is None:
+            self._deadline = self._clock() + max(0.0, grace_seconds)
+
+    def draining(self):
+        return self._deadline is not None and self._clock() >= self._deadline
+
+    def stream_started(self):
+        with self._lock:
+            self._inflight += 1
+
+    def stream_finished(self):
+        with self._lock:
+            self._inflight -= 1
+
+    @property
+    def inflight(self):
+        with self._lock:
+            return self._inflight
+
 # Built once by create_app()/get_app() — never at import time. Declared as
 # None so attribute access before building is a clear error site, not a crash.
 NODE_POOL = None
@@ -149,6 +193,7 @@ health_ledger = None
 node_selector = None
 transport = None
 token_optimizer = None
+shutdown_state = None
 
 
 def require_bearer_token():
@@ -315,6 +360,7 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
 
     global settings, OPTIMIZATION_CONFIG, NODE_POOL
     global health_ledger, node_selector, transport, token_optimizer, app
+    global shutdown_state
     settings = cfg
     OPTIMIZATION_CONFIG = opt
     NODE_POOL = nodes
@@ -337,6 +383,11 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
     )
 
     token_optimizer = TokenOptimizer(config=opt, model_name=cfg.default_model)
+
+    # Shutdown draining: armed by the signal handlers installed below; the
+    # streamed view consults it between chunks (see guarded_stream).
+    shutdown_state = ShutdownState()
+    install_shutdown_handlers(shutdown_state, cfg.stream_drain_window)
 
     application = Flask(__name__)
     application.add_url_rule(
@@ -1002,6 +1053,92 @@ class TokenOptimizer:
         return result
 
 
+# Emitted when draining cuts an in-flight SSE stream: an OpenAI-style error
+# object (so SDK clients surface a failure, not a silent truncation) followed
+# by [DONE] (so their parser terminates cleanly).
+TERMINAL_SSE_EVENT = (
+    b'data: {"error": {"message": "proxy shutting down; completion interrupted", '
+    b'"type": "proxy_shutdown"}}\n\ndata: [DONE]\n\n'
+)
+
+
+def guarded_stream(chunks, *, state):
+    """Wrap a streamed upstream body with shutdown awareness.
+
+    Passes chunks through verbatim while the process is not draining; once
+    ShutdownState.draining() flips, yields the terminal SSE event and stops,
+    closing the inner iterable so the upstream connection is released. The
+    finally also closes inner when this generator itself is closed early
+    (client disconnect mid-stream).
+    """
+    try:
+        state.stream_started()
+        try:
+            for chunk in chunks:
+                if state.draining():
+                    yield TERMINAL_SSE_EVENT
+                    return
+                yield chunk
+        finally:
+            state.stream_finished()
+    finally:
+        close = getattr(chunks, "close", None)
+        if close is not None:
+            close()
+
+
+def _drain_and_exit(state, exit_fn, sleeper):
+    """Dev-server shutdown path: nobody above us orchestrates a graceful
+    stop, so hold the process until in-flight streams drain or the window
+    elapses, then exit. Runs on the main thread inside the signal handler;
+    werkzeug's worker threads are daemons, so exiting ends them."""
+    logger.info(
+        f"Shutdown signal: draining {state.inflight} in-flight stream(s) "
+        f"(STREAM_DRAIN_WINDOW elapsed means immediate exit)"
+    )
+    while not state.draining() and state.inflight > 0:
+        sleeper(0.05)
+    exit_fn(0)
+
+
+def _is_bare_server_handler(prev):
+    """SIG_DFL/SIG_IGN/default_int_handler mean no supervisor owns graceful
+    shutdown — we must orchestrate the exit ourselves."""
+    return prev is None or prev in (signal.SIG_DFL, signal.SIG_IGN, signal.default_int_handler)
+
+
+def install_shutdown_handlers(state, grace_seconds, *,
+                              get_signal=signal.getsignal,
+                              set_signal=signal.signal,
+                              exit_fn=os._exit,
+                              sleeper=time.sleep):
+    """Arm draining on SIGTERM/SIGINT.
+
+    Under gunicorn the previous handler owns the graceful-stop machinery
+    (gthread stops accepting, waits out graceful_timeout): arm first, then
+    delegate to it. Under the bare werkzeug dev server there is no such
+    machinery (previous handler is the default), so drain in-process and
+    exit once streams finish or the window elapses.
+
+    Idempotent: installing twice keeps the first handlers. Must run on the
+    main thread (create_app qualifies under every entrypoint).
+    """
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        prev = get_signal(sig)
+        if getattr(prev, "_rotator_shutdown_chain", False):
+            return
+
+        def handler(signum, frame, _prev=prev):
+            state.arm(grace_seconds)
+            if _is_bare_server_handler(_prev):
+                _drain_and_exit(state, exit_fn, sleeper)
+            else:
+                _prev(signum, frame)
+
+        handler._rotator_shutdown_chain = True
+        set_signal(sig, handler)
+
+
 def dynamic_failover_proxy(path):
     """
     Handle incoming LLM API requests with automatic node rotation and failover.
@@ -1077,7 +1214,10 @@ def dynamic_failover_proxy(path):
         )
 
     if stream_upstream:
-        return Response(result.body(), result.status_code, result.header_pairs)
+        return Response(
+            guarded_stream(result.body(), state=shutdown_state),
+            result.status_code, result.header_pairs,
+        )
 
     body = result.body()
     # Log token usage only for buffered JSON bodies; streamed SSE responses
