@@ -55,6 +55,7 @@ Production runs use gunicorn (`gunicorn.conf.py`, gthread workers): `gunicorn -c
 - The proxy has no built-in authentication — anything that can reach the bind address can spend every node's API key. Compose deliberately binds loopback; front it with auth before exposing it.
 - `config.json` is a client-side IDE snippet (points tools at `http://127.0.0.1:8080/v1`), not server config.
 - Compose `environment:` overrides `env_file:` — don't pin `PROXY_BIND_PORT` in compose or `.env` changes to it silently stop applying (this bit once already).
+- CI's container smoke test sets `-e PROXY_BIND_HOST=0.0.0.0` on purpose: published ports forward to the container's eth0, and standard runner Docker can't reach a loopback-bound service through them (local Docker 29 happens to bridge it, so this reproduces only in CI). Host side stays `-p 127.0.0.1:8080:8080`; don't "simplify" the override away.
 
 ## Agent skills
 

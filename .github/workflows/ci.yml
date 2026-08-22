@@ -30,12 +30,23 @@ jobs:
 
       - name: Container smoke test (/health)
         run: |
-          docker run -d --rm --name llm-rotator \
+          # PROXY_BIND_HOST=0.0.0.0 is required here: a published port
+          # forwards to the container's eth0, and the app's loopback default
+          # (#28) never listens there on standard Docker. Host side stays
+          # loopback-only; compose keeps its own host-networking contract.
+          if ! docker run -d --rm --name llm-rotator \
+            -e PROXY_BIND_HOST=0.0.0.0 \
             -e PROXY_1_URL=socks5h://127.0.0.1:9 \
             -e API_KEY_1=dummy \
             -p 127.0.0.1:8080:8080 \
             llm-rotator:ci
-          curl --fail --silent --show-error \
+          then
+            echo "container failed to start"; exit 1
+          fi
+          if ! curl --fail --silent --show-error \
             --retry 15 --retry-delay 1 --retry-connrefused --retry-all-errors \
             http://127.0.0.1:8080/health
+          then
+            echo "::error::smoke probe failed; container logs:"; docker logs llm-rotator; exit 1
+          fi
           docker stop llm-rotator
