@@ -70,11 +70,16 @@ Today POSTs are retried verbatim on 502/503/504 — a 504 may mean upstream comp
 flag defaulting to current behavior.
 *Acceptance:* documented policy + flag test; no silent behavior change by default.
 
-### 6. Session/threading hygiene — `todo`
+### 6. Session/threading hygiene — `done` (2026-08-22)
 Module-level shared `requests.Session`: cookie-jar mutation races under gthread;
-client cookies are forwarded upstream (privacy leak across egress nodes).
-Stop forwarding cookies (drop `cookies=` unless a use case appears) and evaluate
+client cookies are forwarded upstream (privacy leak across egress nodes). Stop
+forwarding cookies (drop `cookies=` unless a use case appears) and evaluate
 per-thread sessions or disabling cookie persistence entirely.
+Amendment: landed on the failover transport (#14's seam) — client cookies are
+dropped entirely (both the removed `cookies=` channel *and* the `Cookie`
+header, which rode general header passthrough), and the production session
+refuses to store any `Set-Cookie` (`_NoStoreCookiePolicy`): never-mutating jar,
+no race, no bleed, keep-alive kept. Per-thread sessions rejected as unneeded.
 *Acceptance:* suite passes without cookie forwarding; concurrent-load smoke shows no
 cross-request cookie bleed.
 

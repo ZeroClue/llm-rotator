@@ -939,7 +939,6 @@ def dynamic_failover_proxy(path):
     """
     payload = request.get_data()
     method = request.method
-    cookies = request.cookies
 
     # Parse JSON payload (if applicable)
     parsed_payload = None
@@ -982,7 +981,6 @@ def dynamic_failover_proxy(path):
         url=url,
         headers=dict(request.headers),
         payload=payload,
-        cookies=cookies,
         stream=stream_upstream,
     )
 
