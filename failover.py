@@ -135,7 +135,11 @@ class FailoverTransport:
         # outcome so cooldown accounting stays truthful.
         self.retry_posts = retry_posts
 
-    def send(self, method, url, headers, payload=b"", stream=False):
+    def send(self, method, url, headers, payload=b"", stream=False,
+             request_id=None):
+        # request_id is pure log context: it rides every attempt record so
+        # proxy-side and upstream-attempt lines correlate in one grep.
+        log_extras = {"request_id": request_id}
         last_error = None
         attempts = 0
         single_shot_post = method.upper() == "POST" and not self.retry_posts
@@ -152,7 +156,9 @@ class FailoverTransport:
 
             logger.info(
                 f"Attempt {attempt + 1}/{self.max_retries}: Routing via Node {node.node_id} "
-                f"({node.proxy.split('://')[1].split(':')[0]})"
+                f"({node.proxy.split('://')[1].split(':')[0]})",
+                extra={**log_extras, "event": "upstream_attempt",
+                       "node_id": node.node_id, "attempt": attempt + 1},
             )
 
             retry_after = None
@@ -170,17 +176,29 @@ class FailoverTransport:
                     stream=stream,
                 )
             except Timeout as e:
-                logger.error(f"Timeout on Node {node.node_id}: {str(e)}. {next_action}")
+                logger.error(
+                    f"Timeout on Node {node.node_id}: {str(e)}. {next_action}",
+                    extra={**log_extras, "event": "upstream_failure", "node_id": node.node_id,
+                           "attempt": attempt + 1, "reason": "timeout"},
+                )
                 last_error = f"Timeout: {str(e)}"
                 self.ledger.record_failure(node)
                 failed = True
             except ConnectionError as e:
-                logger.error(f"Connection error on Node {node.node_id}: {str(e)}. {next_action}")
+                logger.error(
+                    f"Connection error on Node {node.node_id}: {str(e)}. {next_action}",
+                    extra={**log_extras, "event": "upstream_failure", "node_id": node.node_id,
+                           "attempt": attempt + 1, "reason": "connection_error"},
+                )
                 last_error = f"Connection error: {str(e)}"
                 self.ledger.record_failure(node)
                 failed = True
             except RequestException as e:
-                logger.error(f"Request failed on Node {node.node_id}: {str(e)}. {next_action}")
+                logger.error(
+                    f"Request failed on Node {node.node_id}: {str(e)}. {next_action}",
+                    extra={**log_extras, "event": "upstream_failure", "node_id": node.node_id,
+                           "attempt": attempt + 1, "reason": "request_error"},
+                )
                 last_error = f"Request error: {str(e)}"
                 self.ledger.record_failure(node)
                 failed = True
@@ -188,7 +206,10 @@ class FailoverTransport:
                 if response.status_code in RETRY_STATUSES:
                     logger.warning(
                         f"Node {node.node_id} returned HTTP {response.status_code}. "
-                        f"{next_action}"
+                        f"{next_action}",
+                        extra={**log_extras, "event": "upstream_failure", "node_id": node.node_id,
+                               "attempt": attempt + 1, "reason": "retryable_status",
+                               "status_code": response.status_code},
                     )
                     last_error = f"Upstream error: {response.status_code}"
                     retry_after = parse_retry_after(response.headers.get("Retry-After"))

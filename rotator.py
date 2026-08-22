@@ -1099,7 +1099,7 @@ TERMINAL_SSE_EVENT = (
 )
 
 
-def guarded_stream(chunks, *, state):
+def guarded_stream(chunks, *, state, request_id=""):
     """Wrap a streamed upstream body with shutdown awareness.
 
     Passes chunks through verbatim while the process is not draining; once
@@ -1113,6 +1113,10 @@ def guarded_stream(chunks, *, state):
         try:
             for chunk in chunks:
                 if state.draining():
+                    logger.warning(
+                        "Draining: cutting in-flight SSE stream with terminal event",
+                        extra={"event": "stream_drain_cut", "request_id": request_id},
+                    )
                     yield TERMINAL_SSE_EVENT
                     return
                 yield chunk
@@ -1229,6 +1233,12 @@ def dynamic_failover_proxy(path):
 
     # Construct the full target URL
     url = f"{settings.target_provider_url}/{path}"
+    request_id = g.get("request_id", "")
+    logger.info(
+        f"Proxying {method} /v1/{path} (streaming={stream_upstream})",
+        extra={"event": "proxy_request", "request_id": request_id,
+               "method": method, "path": path, "streaming": stream_upstream},
+    )
 
     result = transport.send(
         method=method,
@@ -1236,6 +1246,7 @@ def dynamic_failover_proxy(path):
         headers=dict(request.headers),
         payload=payload,
         stream=stream_upstream,
+        request_id=request_id,
     )
 
     if isinstance(result, AllNodesFailed):
@@ -1258,7 +1269,8 @@ def dynamic_failover_proxy(path):
 
     if stream_upstream:
         return Response(
-            guarded_stream(result.body(), state=shutdown_state),
+            guarded_stream(result.body(), state=shutdown_state,
+                           request_id=request_id),
             result.status_code, result.header_pairs,
         )
 

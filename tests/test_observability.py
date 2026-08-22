@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from rotator import HealthLedger, Node
+from failover import AllNodesFailed
 
 
 def make_ledger(count=2):
@@ -111,3 +112,75 @@ class TestRequestId:
         assert resp.status_code == 502
         assert json.loads(resp.data)["request_id"] == "corr-502"
         assert resp.headers.get("X-Request-Id") == "corr-502"
+
+
+class TestStructuredLifecycleLogs:
+    def test_attempt_logs_carry_node_attempt_and_request_id(self, caplog):
+        """Scripted fake session, house style from test_failover: a 429 then
+        success must leave structured fields on the attempt log records."""
+        from failover import FailoverTransport
+
+        class FakeResp:
+            def __init__(self, status):
+                self.status_code = status
+                self.headers = {}
+
+            def close(self):
+                pass
+
+        class FakeSession:
+            def __init__(self, statuses):
+                self._statuses = list(statuses)
+
+            def request(self, **kwargs):
+                return FakeResp(self._statuses.pop(0))
+
+        class FakeSelector:
+            def __init__(self, nodes):
+                self.nodes = nodes
+
+            def select(self):
+                return self.nodes[0]
+
+        class FakeLedger:
+            def record_success(self, node):
+                pass
+
+            def record_failure(self, node):
+                pass
+
+        nodes = [Node(node_id=1, proxy="socks5h://10.0.0.1:1055", api_key="k")]
+        transport = FailoverTransport(
+            selector=FakeSelector(nodes), ledger=FakeLedger(),
+            session=FakeSession([429, 200]), sleep=lambda s: None,
+            max_retries=3,
+        )
+        with caplog.at_level(logging.INFO, logger="failover"):
+            result = transport.send(
+                "POST", "http://upstream/v1/chat/completions", headers={},
+                payload=b"{}", request_id="corr-99",
+            )
+        assert not isinstance(result, AllNodesFailed)
+        attempt_events = [
+            r for r in caplog.records if getattr(r, "event", None) == "upstream_attempt"
+        ]
+        assert len(attempt_events) == 2
+        first = attempt_events[0]
+        assert first.node_id == 1 and first.attempt == 1
+        assert first.request_id == "corr-99"
+        failures = [
+            r for r in caplog.records if getattr(r, "event", None) == "upstream_failure"
+        ]
+        assert failures and failures[0].status_code == 429
+
+    def test_proxy_request_log_carries_request_id(self, client, caplog):
+        with caplog.at_level(logging.INFO, logger="rotator"):
+            resp = client.post(
+                "/v1/chat/completions",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+                headers={"X-Request-Id": "trace-7"},
+            )
+        assert resp.status_code == 200
+        entries = [r for r in caplog.records if getattr(r, "event", None) == "proxy_request"]
+        assert entries and entries[0].request_id == "trace-7"
+        assert entries[0].path == "chat/completions"
