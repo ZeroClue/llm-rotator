@@ -28,12 +28,6 @@ from werkzeug.exceptions import HTTPException
 
 from failover import AllNodesFailed, FailoverTransport
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    force=True
-)
 logger = logging.getLogger(__name__)
 
 # Try to import tiktoken for token counting (optional but recommended)
@@ -55,26 +49,63 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration via Environment Variables
 # ─────────────────────────────────────────────────────────────────────────────
-BIND_HOST = os.getenv("PROXY_BIND_HOST", "127.0.0.1")
-BIND_PORT = int(os.getenv("PROXY_BIND_PORT", "8080"))
-TARGET_PROVIDER_URL = os.getenv("LLM_PROVIDER_URL", "https://api.openai.com/v1")
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "4"))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "25.0"))
-RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "0.5"))
-RETRY_BACKOFF_MAX = float(os.getenv("RETRY_BACKOFF_MAX", "8.0"))
-NODE_COOLDOWN_BASE = float(os.getenv("NODE_COOLDOWN_BASE", "2.0"))
-NODE_COOLDOWN_MAX = float(os.getenv("NODE_COOLDOWN_MAX", "60.0"))
-# POSTs are retried verbatim on failover; a 504/timeout may mean the upstream
-# completed, so duplicate-averse operators can set RETRY_POSTS=false.
-RETRY_POSTS = os.getenv("RETRY_POSTS", "true").strip().lower() == "true"
-
-
 def _env_bool(raw):
     return raw.strip().lower() == "true"
 
+
+@dataclass(frozen=True)
+class Settings:
+    """Core/runtime knobs, parsed from the environment in exactly one place
+    (from_env) when create_app() runs. Importing this module parses nothing."""
+
+    log_level: str = "INFO"
+    bind_host: str = "127.0.0.1"
+    bind_port: int = 8080
+    target_provider_url: str = "https://api.openai.com/v1"
+    max_retries: int = 4
+    request_timeout: float = 25.0
+    retry_backoff_base: float = 0.5
+    retry_backoff_max: float = 8.0
+    node_cooldown_base: float = 2.0
+    node_cooldown_max: float = 60.0
+    # POSTs are retried verbatim on failover; a 504/timeout may mean the upstream
+    # completed, so duplicate-averse operators can set RETRY_POSTS=false.
+    retry_posts: bool = True
+    default_model: str = "gpt-4o"
+    # Optional bearer-token gate. Empty disables auth entirely. /health and
+    # /ready stay open either way so orchestrators can probe without the token.
+    auth_token: str = ""
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        return cls(
+            log_level=os.getenv("LOG_LEVEL", "INFO"),
+            bind_host=os.getenv("PROXY_BIND_HOST", "127.0.0.1"),
+            bind_port=int(os.getenv("PROXY_BIND_PORT", "8080")),
+            target_provider_url=os.getenv("LLM_PROVIDER_URL", "https://api.openai.com/v1"),
+            max_retries=int(os.getenv("MAX_RETRIES", "4")),
+            request_timeout=float(os.getenv("REQUEST_TIMEOUT", "25.0")),
+            retry_backoff_base=float(os.getenv("RETRY_BACKOFF_BASE", "0.5")),
+            retry_backoff_max=float(os.getenv("RETRY_BACKOFF_MAX", "8.0")),
+            node_cooldown_base=float(os.getenv("NODE_COOLDOWN_BASE", "2.0")),
+            node_cooldown_max=float(os.getenv("NODE_COOLDOWN_MAX", "60.0")),
+            retry_posts=_env_bool(os.getenv("RETRY_POSTS", "true")),
+            default_model=os.getenv("DEFAULT_MODEL", "gpt-4o"),
+            auth_token=os.getenv("PROXY_AUTH_TOKEN", ""),
+        )
+
+
+def configure_logging(settings):
+    """(Re)apply root logging config; safe to call per app build."""
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        force=True,
+    )
+
+
 # Token-optimization settings live in OptimizationConfig.from_env() — parsed
 # in exactly one place, next to the pipeline class below.
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Build Node Pool from Environment Variables
@@ -109,31 +140,25 @@ def build_node_pool():
     logger.info(f"Node pool initialized with {len(pool)} nodes")
     return pool
 
-try:
-    NODE_POOL = build_node_pool()
-except Exception as e:
-    logger.critical(f"Failed to initialize node pool: {e}")
-    raise SystemExit(1)
+# Built once by create_app()/get_app() — never at import time. Declared as
+# None so attribute access before building is a clear error site, not a crash.
+NODE_POOL = None
+settings = None
+OPTIMIZATION_CONFIG = None
+health_ledger = None
+node_selector = None
+transport = None
+token_optimizer = None
 
 
-# Initialize Flask app; the upstream HTTP session lives inside the transport.
-app = Flask(__name__)
-
-# Optional bearer-token gate. Empty disables auth entirely (current behavior
-# for existing deployments). /health and /ready stay open either way so
-# orchestrators can probe the process without holding the token.
-PROXY_AUTH_TOKEN = os.getenv("PROXY_AUTH_TOKEN", "")
-
-
-@app.before_request
 def require_bearer_token():
-    if not PROXY_AUTH_TOKEN or request.path in ("/health", "/ready"):
+    if not settings.auth_token or request.path in ("/health", "/ready"):
         return None
     provided = request.headers.get("Authorization", "")
     # Bytes, not str: compare_digest raises TypeError on non-ASCII str, and
     # client-supplied headers can contain anything. utf-8 encoding never does.
     if not hmac.compare_digest(
-        provided.encode("utf-8"), f"Bearer {PROXY_AUTH_TOKEN}".encode("utf-8")
+        provided.encode("utf-8"), f"Bearer {settings.auth_token}".encode("utf-8")
     ):
         return Response(
             json.dumps({
@@ -277,23 +302,75 @@ def node_health_snapshot(nodes, ledger, now=None):
     } for n in nodes]
 
 
-# One shared reentrant lock keeps ledger updates atomic with selection,
-# matching the previous single-lock behavior of the combined class.
-_ledger_lock = threading.RLock()
-health_ledger = HealthLedger(NODE_POOL, NODE_COOLDOWN_BASE, NODE_COOLDOWN_MAX, lock=_ledger_lock)
-node_selector = NodeSelector(NODE_POOL, health_ledger, lock=_ledger_lock)
+def create_app(cfg=None, optimization_config=None) -> Flask:
+    """Build settings -> services -> Flask app from the environment.
 
-# Retry/failover transport: env read once here; session/sleeper/rng default
-# to production adapters inside the module.
-transport = FailoverTransport(
-    selector=node_selector,
-    ledger=health_ledger,
-    max_retries=MAX_RETRIES,
-    timeout=REQUEST_TIMEOUT,
-    backoff_base=RETRY_BACKOFF_BASE,
-    backoff_max=RETRY_BACKOFF_MAX,
-    retry_posts=RETRY_POSTS,
-)
+    The only place anything is constructed; importing this module runs
+    nothing. Both config objects are injectable for tests."""
+    cfg = cfg or Settings.from_env()
+    opt = optimization_config or OptimizationConfig.from_env()
+    configure_logging(cfg)
+
+    nodes = build_node_pool()
+
+    global settings, OPTIMIZATION_CONFIG, NODE_POOL
+    global health_ledger, node_selector, transport, token_optimizer, app
+    settings = cfg
+    OPTIMIZATION_CONFIG = opt
+    NODE_POOL = nodes
+
+    # One shared reentrant lock keeps ledger updates atomic with selection.
+    _ledger_lock = threading.RLock()
+    health_ledger = HealthLedger(nodes, cfg.node_cooldown_base, cfg.node_cooldown_max, lock=_ledger_lock)
+    node_selector = NodeSelector(nodes, health_ledger, lock=_ledger_lock)
+
+    # Retry/failover transport: session/sleeper/rng default to production
+    # adapters inside the module.
+    transport = FailoverTransport(
+        selector=node_selector,
+        ledger=health_ledger,
+        max_retries=cfg.max_retries,
+        timeout=cfg.request_timeout,
+        backoff_base=cfg.retry_backoff_base,
+        backoff_max=cfg.retry_backoff_max,
+        retry_posts=cfg.retry_posts,
+    )
+
+    token_optimizer = TokenOptimizer(config=opt, model_name=cfg.default_model)
+
+    application = Flask(__name__)
+    application.add_url_rule(
+        "/v1/<path:path>", "dynamic_failover_proxy", dynamic_failover_proxy,
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    )
+    application.add_url_rule("/health", "health_check", health_check)
+    application.add_url_rule("/ready", "ready_check", ready_check)
+    application.add_url_rule("/v1/models", "list_models", list_models)
+    application.before_request(require_bearer_token)
+    application.register_error_handler(Exception, handle_exception)
+    app = application
+    return app
+
+
+# Built lazily on first attribute access so gunicorn's `rotator:app` works
+# while a bare `import rotator` constructs nothing. The `app` global comes
+# into existence only when something builds it — deliberately NOT declared
+# as a placeholder, or `rotator:app` would resolve to None without building.
+def get_app() -> Flask:
+    """Build the Flask app from the environment once; cached thereafter."""
+    if globals().get("app") is None:
+        try:
+            create_app()
+        except Exception as e:
+            logger.critical(f"Failed to initialize proxy: {e}")
+            raise SystemExit(1)
+    return app
+
+
+def __getattr__(name):
+    if name == "app":
+        return get_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -925,12 +1002,6 @@ class TokenOptimizer:
         return result
 
 
-# Initialize token optimizer
-OPTIMIZATION_CONFIG = OptimizationConfig.from_env()
-token_optimizer = TokenOptimizer(config=OPTIMIZATION_CONFIG, model_name=DEFAULT_MODEL)
-
-
-@app.route('/v1/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
 def dynamic_failover_proxy(path):
     """
     Handle incoming LLM API requests with automatic node rotation and failover.
@@ -978,7 +1049,7 @@ def dynamic_failover_proxy(path):
         payload = json.dumps(parsed_payload).encode('utf-8')
 
     # Construct the full target URL
-    url = f"{TARGET_PROVIDER_URL}/{path}"
+    url = f"{settings.target_provider_url}/{path}"
 
     result = transport.send(
         method=method,
@@ -991,7 +1062,7 @@ def dynamic_failover_proxy(path):
     if isinstance(result, AllNodesFailed):
         logger.critical(
             f"All retry attempts exhausted ({result.attempts} attempt(s), "
-            f"MAX_RETRIES={MAX_RETRIES}). Last error: {result.last_error}"
+            f"MAX_RETRIES={settings.max_retries}). Last error: {result.last_error}"
         )
         return Response(
             json.dumps({
@@ -1032,7 +1103,6 @@ def nodes_available_count():
     return sum(1 for e in state.values() if e["cooldown_seconds"] <= 0)
 
 
-@app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for monitoring."""
     nodes = node_health_snapshot(NODE_POOL, health_ledger)
@@ -1048,7 +1118,6 @@ def health_check():
     }), 200
 
 
-@app.route('/ready', methods=['GET'])
 def ready_check():
     """Readiness for orchestrators: 503 while every node is in cooldown."""
     available = nodes_available_count()
@@ -1057,12 +1126,11 @@ def ready_check():
     return jsonify({"status": "ready", "nodes_available": available}), 200
 
 
-@app.route('/v1/models', methods=['GET'])
 def list_models():
     """Proxy model listing endpoint (full failover via the transport)."""
     result = transport.send(
         method="GET",
-        url=f"{TARGET_PROVIDER_URL}/models",
+        url=f"{settings.target_provider_url}/models",
         headers={},
     )
     if isinstance(result, AllNodesFailed):
@@ -1071,7 +1139,6 @@ def list_models():
     return Response(result.body(), result.status_code, result.header_pairs)
 
 
-@app.errorhandler(Exception)
 def handle_exception(e):
     """Global exception handler; HTTP errors keep their own status codes."""
     if isinstance(e, HTTPException):
@@ -1086,15 +1153,20 @@ def handle_exception(e):
 
 
 if __name__ == '__main__':
+    try:
+        application = create_app()
+    except Exception as e:
+        logger.critical(f"Failed to initialize proxy: {e}")
+        raise SystemExit(1)
     logger.info("=" * 70)
     logger.info("🚀 Secure Tailscale LLM Proxy Rotator Starting...")
     logger.info("=" * 70)
-    logger.info(f"Binding to: {BIND_HOST}:{BIND_PORT}")
-    logger.info(f"Target Provider: {TARGET_PROVIDER_URL}")
+    logger.info(f"Binding to: {settings.bind_host}:{settings.bind_port}")
+    logger.info(f"Target Provider: {settings.target_provider_url}")
     logger.info(f"Token Optimization: {'ENABLED' if OPTIMIZATION_CONFIG.enabled else 'DISABLED'}")
     logger.info(f"Max Context Tokens: {OPTIMIZATION_CONFIG.max_context_tokens:,}")
     logger.info(f"Reserved Response Tokens: {OPTIMIZATION_CONFIG.reserved_response_tokens:,}")
     logger.info(f"Active Nodes: {len(NODE_POOL)}")
     logger.info("=" * 70)
-    
-    app.run(host=BIND_HOST, port=BIND_PORT, threaded=True)
+
+    application.run(host=settings.bind_host, port=settings.bind_port, threaded=True)

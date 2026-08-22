@@ -20,7 +20,9 @@ services:
       # PROXY_BIND_HOST: 0.0.0.0 exposes an UNAUTHENTICATED gateway on all host interfaces.
       # PROXY_BIND_PORT comes from .env (default 8080 inside gunicorn.conf.py).
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4).status==200 else 1)"]
+      # Shell form so the port follows PROXY_BIND_PORT from .env instead of a
+      # hardcoded 8080 ($$ escapes compose interpolation; resolved in-container).
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys,os; sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{os.getenv(\\\"PROXY_BIND_PORT\\\", \\\"8080\\\")}/health', timeout=4).status==200 else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
