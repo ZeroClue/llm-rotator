@@ -63,11 +63,15 @@ or hold shutdown until streams finish with a bounded drain window env var
 *Acceptance:* integration test: start stream, SIGTERM master, client either receives
 the full body within the drain window or a well-formed terminal SSE event.
 
-### 5. Idempotency-aware retry policy — `todo`
+### 5. Idempotency-aware retry policy — `done` (2026-08-22)
 Today POSTs are retried verbatim on 502/503/504 — a 504 may mean upstream completed
 (double billing). Add per-attempt budget note in logs, consider honoring
 `X-Request-Id` passthrough, document the trade-off, or gate POST-retry behind an env
 flag defaulting to current behavior.
+Amendment: `RETRY_POSTS` env (default `true` = unchanged) gates verbatim POST
+failover; `false` gives POSTs one attempt, ledger still records the outcome.
+Trade-off documented in `.env.example` + AGENTS.md. Per-attempt budget already in
+the attempt log; `X-Request-Id` passthrough deferred to item 9 (observability).
 *Acceptance:* documented policy + flag test; no silent behavior change by default.
 
 ### 6. Session/threading hygiene — `done` (2026-08-22)

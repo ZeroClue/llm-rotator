@@ -73,7 +73,8 @@ def stub_rng(lo, hi):
 
 
 def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
-                   backoff_base=0.5, backoff_max=8.0, use_real_session=False):
+                   backoff_base=0.5, backoff_max=8.0, use_real_session=False,
+                   retry_posts=True):
     nodes = [
         rotator.Node(node_id=i, proxy=f"socks5h://node{i}.ts.net:1080", api_key=f"key{i}")
         for i in range(1, count + 1)
@@ -91,8 +92,30 @@ def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
         timeout=timeout,
         backoff_base=backoff_base,
         backoff_max=backoff_max,
+        retry_posts=retry_posts,
     )
     return transport, ledger, sleeper, nodes, session or transport.session
+
+
+def test_retry_posts_disabled_gives_post_exactly_one_attempt(rotator):
+    r502, rok_a, rok_b = (FakeResponse(status=502), FakeResponse(status=200),
+                          FakeResponse(status=200))
+    t, ledger, sleeper, nodes, session = make_transport(
+        rotator, [r502, rok_a, rok_b], max_retries=3, retry_posts=False)
+
+    result = t.send("POST", "http://up.test/v1/chat/completions", headers={})
+
+    assert isinstance(result, failover.AllNodesFailed)
+    assert result.last_error == "Upstream error: 502"
+    assert session.call_count == 1  # no failover attempt
+    assert sleeper.sleeps == []     # no pacing
+    assert not ledger.usable(nodes[0])  # outcome still recorded
+
+    # The same failure still fails over for idempotent methods; the cooling
+    # first node is skipped, so the GET lands on node 2 directly.
+    result = t.send("GET", "http://up.test/v1/models", headers={})
+    assert isinstance(result, failover.SendResult)
+    assert session.call_count == 2
 
 
 def test_429_records_cooldown_and_retries_on_next_node(rotator):
