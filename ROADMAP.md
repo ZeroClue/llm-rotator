@@ -229,7 +229,9 @@ operating multi-node pools today means curl + grep. Maintainer wants a proper
 dashboard before any 1.0 claim (2026-08-22).
 *Note:* deliberately un-specced — grill and/or wayfinder before building.
 Spans UI plus likely a read-back config API, so expect decomposition into a
-map with child tickets rather than one item.
+map with child tickets rather than one item. Charting is done: work the map
+at [issue #39](https://github.com/ZeroClue/llm-rotator/issues/39) (research
+branch: `research/live-refresh-patterns`; next up: visual prototype #43).
 
 ---
 
