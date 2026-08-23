@@ -81,7 +81,7 @@ Production runs use gunicorn (`gunicorn.conf.py`, gthread workers): `gunicorn -c
 
 ### Implementation workflow
 
-Before committing anything, opening a PR, or merging: follow the gated implementation workflow. See `docs/agents/implementation-workflow.md`.
+Before committing anything, opening a PR, or merging: follow the gated implementation workflow (`edukai/`-only commits are exempt via its fast lane). See `docs/agents/implementation-workflow.md`.
 
 ### Issue tracker
 

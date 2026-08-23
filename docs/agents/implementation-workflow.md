@@ -7,7 +7,7 @@ workflow until it passes.
 Applies to every change that lands on `main`, including docs-only changes — with one
 **fast lane**: commits whose changed paths are exclusively under `edukai/` (the education
 store) may land directly on `main` with no ticket, branch, PR, or pre-merge review; CI
-still runs post-hoc, and store hygiene is enforced by the heartbeat Audit checklist in
+still runs post-hoc on pushes, and store hygiene is enforced by the heartbeat Audit checklist in
 `edukai/AGENTS.md`. Mixing any path outside `edukai/` into a commit voids the exemption
 (`.gitignore`/`.dockerignore` edits made for the store's benefit included). README,
 `docs/`, and ADRs are project-facing claims and never qualify.

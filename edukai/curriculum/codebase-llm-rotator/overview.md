@@ -14,4 +14,4 @@ The app is built lazily and exactly once from the environment: importing `rotato
 
 - How `FailoverTransport`'s constructor seams (session/sleeper/rng injection) should map onto transports beyond requests/curl_cffi — candidate for a second lesson once next touched.
 
-Lessons: 2 · oldest 2026-08-24 · newest 2026-08-24 — refresh on every regeneration; old dates mean re-verify before trusting.
+Lessons: 3 · oldest 2026-08-24 · newest 2026-08-24 — refresh on every regeneration; old dates mean re-verify before trusting.
