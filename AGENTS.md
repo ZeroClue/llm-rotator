@@ -6,6 +6,11 @@ Flask proxy that rotates OpenAI-compatible LLM requests across Tailscale SOCKS5 
 
 `ROADMAP.md` tracks prioritized future work with acceptance tests. Check it before proposing or building new features (avoid duplicating planned items), and flip item statuses (`todo`/`in progress`/`done`) as part of any change that affects them. Agent workflow docs: `docs/agents/`.
 
+## Education store
+
+This project keeps an education store at ./edukai/.
+Session start: read edukai/SYLLABUS.md and follow edukai/AGENTS.md scoped to that directory.
+
 ## Commands
 
 ```bash
