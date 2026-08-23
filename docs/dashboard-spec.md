@@ -15,8 +15,8 @@ ledger, request ring, reason buckets).
 - Vendored htmx (already at `static/vendor/htmx.min.js`, ~48 KB raw /
   ~17 KB gzipped) — periodic polling only; SSE rejected (pins a gthread
   thread per tab); `<noscript>` meta-refresh fallback.
-- One page, anchored sections: `/admin#nodes`, `/#requests`, `/#config` —
-  each an independently-polling htmx fragment.
+- One page, anchored sections: `/admin#nodes`, `/admin#requests`,
+  `/admin#config` — each an independently-polling htmx fragment.
 
 ## 2. Layout (variant A verdict, #43)
 
@@ -35,13 +35,18 @@ a collapsed footer `<details>`. Amendments from the verdict:
 ### 3.1 Nodes (`#nodes`, poll ~3s)
 
 - Summary strip: nodes-available gauge · in-flight streams gauge ·
-  draining badge · fleet request/token rate (from reason buckets).
+  draining badge.
 - Node table columns: `#` (+ ▶ cursor marker on the rotation-cursor row) ·
-  persona UA · egress host · status badge (`usable` / `cooling 42s`) ·
-  cooldown countdown+bar · last error (reason + ago) · ttfb/total (when
-  measured) · quota % · ok/fail counts · per-minute outcome sparkline.
+  persona UA (post-#50 addition — deliberate, not in the original #40
+  inventory) · egress host · status badge (`usable` / `cooling 42s`) ·
+  cooldown countdown+bar · consecutive failures · last error (reason +
+  ago) · quota % (ledger headroom, `budget_remaining_pct` from #48) ·
+  ok/fail counts with derived success % · per-minute outcome sparkline.
 - Sparkline: 60-minute outcome history from reason buckets, success vs
   failure shading.
+- Per-node latency rollups are **out of v1**: latency is per-request in
+  §3.2; a per-node aggregate needs ring scanning and lands later if
+  wanted.
 
 ### 3.2 Recent requests (`#requests`, poll ~5s)
 
@@ -63,7 +68,8 @@ a collapsed footer `<details>`. Amendments from the verdict:
 - Global pause toggle (stops all polling).
 - Per-fragment staleness self-report: "updated Ns ago", stale styling past
   2× poll interval — a dead API never looks healthy.
-- Aggregate line: tokens served (last hour / lifetime), request rate.
+- Aggregate line (the single home for fleet rates): tokens served
+  (last hour / lifetime) + request rate — both from reason buckets.
 - Footer: uptime + started-at (no version string in v1).
 
 ## 4. Backend contract (`telemetry.py`, new module)
@@ -89,17 +95,18 @@ The view writes ring entries after `send()` returns.
 
 `deque(maxlen=200)` of: `ts, request_id, method, path, node_id, outcome
 (ok | failed | single_shot_abort), status_code, ttfb_ms, total_ms, tokens
-{prompt, completion, total} | None, attempts[]`. No bodies, no keys, no
-persistence. Latency rule for both modes: **TTFB = first byte available to
-forward; total = last byte forwarded.** Streamed entries are written on
-send-return and updated in place at stream end.
+{prompt, completion, total} | None, attempts[]`. `single_shot_abort` = a
+POST under `RETRY_POSTS=false` whose single attempt failed. No bodies, no
+keys, no persistence. Latency rule for both modes: **TTFB = first byte
+available to forward; total = last byte forwarded.** Streamed entries are
+written on send-return and updated in place at stream end.
 
 ### 4.4 Reason buckets
 
 Per node: per-minute counters over the taxonomy **plus a token-sum per
 minute**; 60-minute retention, pruned on write. Powers sparklines, "last
-failure Nm ago", last-hour aggregates. Lifetime token total: counter fed
-where usage is already parsed in the view (buffered 200s).
+failure Nm ago", last-hour aggregates. Lifetime token total: a counter fed
+in the view at the existing usage-parse site (buffered 200 responses).
 
 ### 4.5 Gauges & identity
 
@@ -130,8 +137,8 @@ New series alongside the existing ones: per-reason attempt counters
 ## 7. Non-goals (v1)
 
 Action buttons (cooldown reset, drain-now) · editing config · JSON API ·
-multi-user auth · persistence beyond process-local buffers · mobile polish ·
-Grafana link-outs.
+multi-user auth · multi-tab sync · persistence beyond process-local
+buffers · mobile polish · Grafana link-outs.
 
 ## 8. Testing approach
 
@@ -148,8 +155,11 @@ Grafana link-outs.
 ## 9. Build decomposition (proposed tickets)
 
 1. **telemetry.py + attempts seam + /metrics parity** — module, transport
-   `.attempts`, view wiring, new metric series. (Unit-tested.)
+   `.attempts`, view wiring, new metric series, and the CONTEXT.md
+   glossary entries for *request ring* and *reason buckets*. (Unit-tested.)
 2. **`/admin` page + nodes & config fragments** — layout per §2–3,
-   prototype folded in as the starting point.
+   prototype folded in as the starting point, plus the bearer-gate
+   exemption wiring for `/admin*` (currently hardcoded to
+   `/health`, `/ready`, `/metrics`).
 3. **Requests section** — ring table, expandable attempt rows, empty state.
 4. **Chrome** — pause toggle, staleness self-report, aggregate line, footer.
