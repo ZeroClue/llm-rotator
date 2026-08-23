@@ -37,7 +37,7 @@ def test_nodes_fragment_shows_cooldown_countdown(client, rotator):
     try:
         html = client.get("/admin/fragments/nodes").get_data(as_text=True)
         assert "cooling" in html
-        assert "2s" in html            # countdown-first format
+        assert "<b>2s</b>" in html     # countdown-first format
     finally:
         rotator.health_ledger.reset_all()
 
@@ -63,14 +63,13 @@ def test_nodes_fragment_renders_sparkline_slots(client, rotator,
     assert 'class="f"' in html         # a failure slot is shaded
 
 
-def test_config_fragment_masks_token_and_labels_env_vars(client, rotator):
-    masked = dataclasses.replace(rotator.settings, auth_token="super-secret")
-    monkeypatched = pytest.MonkeyPatch()
-    monkeypatched.setattr(rotator, "settings", masked)
-    try:
-        html = client.get("/admin/fragments/config").get_data(as_text=True)
-    finally:
-        monkeypatched.undo()
+def test_config_fragment_masks_token_and_labels_env_vars(client, rotator,
+                                                          monkeypatch):
+    monkeypatch.setattr(
+        rotator, "settings",
+        dataclasses.replace(rotator.settings, auth_token="super-secret"))
+
+    html = client.get("/admin/fragments/config").get_data(as_text=True)
 
     assert "****" in html
     assert "super-secret" not in html
@@ -79,9 +78,9 @@ def test_config_fragment_masks_token_and_labels_env_vars(client, rotator):
 
 
 def test_admin_exempt_from_bearer_gate(rotator, monkeypatch):
-    import dataclasses
-    gated = dataclasses.replace(rotator.settings, auth_token="sekrit")
-    monkeypatch.setattr(rotator, "settings", gated)
+    monkeypatch.setattr(
+        rotator, "settings",
+        dataclasses.replace(rotator.settings, auth_token="sekrit"))
     client = rotator.app.test_client()
 
     # Dashboard routes open; proxy still gated.

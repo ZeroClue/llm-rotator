@@ -41,12 +41,20 @@ def _cooldown_display(seconds):
     return ""
 
 
+def _spark_height(slot):
+    """Bar height % for one minute slot: failures dominate, ok counts add."""
+    if not (slot["ok"] or slot["fail"]):
+        return 2
+    return min(100, slot["fail"] * 25 + slot["ok"] * 12)
+
+
 def register_admin_dashboard(application, *, context_provider):
     """Called from create_app(); context_provider() supplies nodes snapshot,
     cursor index, in-flight count, draining flag, settings, optimization
     config, uptime seconds — injected so this module never imports rotator."""
     bp = Blueprint("admin_dashboard", __name__)
     bp.add_app_template_global(_mask, "mask")
+    bp.add_app_template_global(_spark_height, "spark_height")
 
     @bp.route("/admin")
     def admin_page():

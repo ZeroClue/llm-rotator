@@ -35,7 +35,7 @@
       <td>{{ ok_pct }}{% if ok_pct != '—' %}%{% endif %}</td>
       <td>
         <span class="spark" title="per-minute outcomes, last hour">
-        {% for slot in n.window %}{% if slot.fail %}<i class="f"{% else %}<i class="o"{% endif %} style="height: {{ [slot.fail * 25 + slot.ok * 12, 12] | max if slot.fail or slot.ok else 2 }}%"></i>{% endfor %}
+        {% for slot in n.window %}{% if slot.fail %}<i class="f"{% else %}<i class="o"{% endif %} style="height: {{ spark_height(slot) }}%"></i>{% endfor %}
         </span>
       </td>
     </tr>
