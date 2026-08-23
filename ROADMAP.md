@@ -193,6 +193,21 @@ dict without `node_id`. From the 2026-08-21 architecture review.
 rules (record_failure / usable / cooldown_remaining) unit-tested without sleeps
 or HTTP.
 
+### 19. Persona unlinkability — `in progress` (2026-08-23, epic #45)
+Make the N (egress IP, API key) pairs look like N unrelated customers to provider
+anti-abuse systems; stop leaking one-operator signals (client telemetry headers,
+`x-api-key`/org headers riding upstream, byte-identical cross-persona replays).
+Design grilled 2026-08-23 — decisions recorded in [epic #45](https://github.com/ZeroClue/llm-rotator/issues/45):
+unconditional credential/org header drops + `PERSONA_HYGIENE`-gated telemetry/payload
+hygiene (#49); persona model with hash-derived API-client stacks (#50); same-persona
+Retry-After ladder with bounded waiter cap + per-attempt serialization jitter (#46);
+headroom-class budget routing from quota headers (#48); flag-gated curl_cffi
+transport with per-persona pinned fingerprints (#47). Order 49 → 50 → 46 → 48 → 47.
+Non-goals documented in the ADR landing with #50: payment-KYC linkage, stylometry,
+canonicalized-body hashing, host-clock timing.
+*Acceptance:* per-ticket criteria on #46–#50; threat model + residual risks recorded
+in an ADR before any persona attribute reaches upstream traffic.
+
 ## Later (nice-to-have / strategic)
 
 ### 9. Observability — `done` (2026-08-22, issue #34)

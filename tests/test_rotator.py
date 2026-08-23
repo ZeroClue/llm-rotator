@@ -55,6 +55,28 @@ def test_default_config_does_not_inject_cache_control(client, chat_captures):
     assert isinstance(sent["messages"][0]["content"], str)
 
 
+def test_credential_and_org_headers_never_reach_upstream(client, chat_captures):
+    """End-to-end: a client's own key/org identity must not ride to the
+    provider even though the proxy injected its per-node Authorization."""
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": BASIC_MESSAGES},
+        headers={
+            "x-api-key": "sk-client-real",
+            "api-key": "azure-client-key",
+            "openai-organization": "org-leak",
+            "OpenAI-Project": "proj-leak",
+        },
+    )
+    assert resp.status_code == 200
+
+    captured = chat_captures()[-1]
+    sent = {k.lower(): v for k, v in captured["headers"].items()}
+    assert captured["auth"] == "Bearer node-two-key"  # node key injected
+    for leaked in ("x-api-key", "api-key", "openai-organization", "openai-project"):
+        assert leaked not in sent
+
+
 def test_explicit_prompt_caching_adds_valid_markers(client, chat_captures, make_optimizer):
     make_optimizer(enable_prompt_caching=True)
     resp = client.post("/v1/chat/completions", json={"model": "gpt-4o", "messages": BASIC_MESSAGES})

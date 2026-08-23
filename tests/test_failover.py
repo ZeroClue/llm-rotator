@@ -74,7 +74,7 @@ def stub_rng(lo, hi):
 
 def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
                    backoff_base=0.5, backoff_max=8.0, use_real_session=False,
-                   retry_posts=True):
+                   retry_posts=True, hygiene=False):
     nodes = [
         rotator.Node(node_id=i, proxy=f"socks5h://node{i}.ts.net:1080", api_key=f"key{i}")
         for i in range(1, count + 1)
@@ -93,6 +93,7 @@ def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
         backoff_base=backoff_base,
         backoff_max=backoff_max,
         retry_posts=retry_posts,
+        hygiene=hygiene,
     )
     return transport, ledger, sleeper, nodes, session or transport.session
 
@@ -271,6 +272,54 @@ def test_client_cookies_never_reach_the_upstream(rotator):
     call = session.calls[0]
     assert call["headers"].get("Cookie") is None
     assert "cookie" not in {k.lower() for k in call["headers"]}
+
+
+def test_credential_and_org_headers_never_reach_upstream(rotator):
+    """x-api-key/api-key would defeat per-node key injection (a client's real
+    key riding upstream); openai-organization/openai-project carry account
+    identity. Dropped unconditionally — no flags involved."""
+    rok = FakeResponse(status=200, content=b"ok")
+    t, *_ , session = make_transport(rotator, [rok])
+
+    t.send("POST", "http://up.test/v1/chat/completions",
+           headers={
+               "x-api-key": "sk-client-real",
+               "api-key": "azure-client-key",
+               "openai-organization": "org-leak",
+               "OpenAI-Project": "proj-leak",
+           },
+           payload=b"{}")
+
+    sent = {k.lower(): v for k, v in session.calls[0]["headers"].items()}
+    assert sent["authorization"] == "Bearer key1"  # per-node key still injected
+    for leaked in ("x-api-key", "api-key", "openai-organization", "openai-project"):
+        assert leaked not in sent
+
+
+@pytest.mark.parametrize("hygiene", [True, False])
+def test_persona_hygiene_telemetry_headers(rotator, hygiene):
+    """PERSONA_HYGIENE extends the drop set with client telemetry that
+    fingerprints the automation stack; unrelated headers always pass."""
+    rok = FakeResponse(status=200, content=b"ok")
+    t, *_ , session = make_transport(rotator, [rok], hygiene=hygiene)
+
+    t.send("POST", "http://up.test/v1", headers={
+        "X-Stainless-Lang": "python",
+        "x-stainless-runtime": "CPython 3.11",
+        "x-app": "coding-agent",
+        "X-Title": "agent-title",
+        "Http-Referer": "http://localhost:5173",
+        "Keep-Me": "yes",
+    })
+
+    sent = {k.lower() for k in session.calls[0]["headers"]}
+    assert "keep-me" in sent  # unrelated header passes either way
+    telemetry = {"x-stainless-lang", "x-stainless-runtime",
+                 "x-app", "x-title", "http-referer"}
+    if hygiene:
+        assert not sent & telemetry
+    else:
+        assert telemetry <= sent
 
 
 def test_production_session_never_stores_upstream_cookies(rotator):

@@ -148,6 +148,7 @@ index and silently drops later nodes.
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `LOG_FORMAT` | `text` | `json` emits one structured object per line (`ts`, `level`, `logger`, `message`, plus `request_id`/`node_id`/`outcome` fields on lifecycle events) |
 | `PROXY_AUTH_TOKEN` | *(empty)* | Optional bearer gate: when set, `/v1/*` requires `Authorization: Bearer <token>` (401 otherwise). `/health`, `/ready`, and `/metrics` stay open |
+| `PERSONA_HYGIENE` | `false` | Additionally strips client telemetry headers (`x-stainless-*`, `x-app`, `x-title`, `http-referer`) and removes provider identity fields (`user`, `metadata`, `prompt_cache_key`, `safety_identifier`) from chat payloads. Credential/organization headers (`x-api-key`, `api-key`, `openai-organization`, `openai-project`) are **always** dropped — they would leak the caller's real key past per-node injection |
 
 ### Nodes (repeat contiguously from 1)
 

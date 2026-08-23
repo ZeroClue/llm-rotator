@@ -43,6 +43,73 @@ def test_gate_noop_when_disabled(rotator):
     assert result is payload
 
 
+def test_persona_hygiene_strips_identity_fields(rotator):
+    opt = build(rotator, persona_hygiene=True)
+    payload = chat_payload(
+        [{"role": "user", "content": "hi"}],
+        user="end-user-123",
+        metadata={"user_id": "abc"},
+        prompt_cache_key="cache-key",
+        safety_identifier="safety-1",
+    )
+    before = copy.deepcopy(payload)
+
+    out = opt.optimize_context(payload, path="v1/chat/completions")
+
+    stripped = {"user", "metadata", "prompt_cache_key", "safety_identifier"}
+    assert not stripped & set(out)
+    assert out["messages"] == payload["messages"]  # messages untouched
+    assert out["model"] == "gpt-4o"  # unrelated fields preserved
+    assert payload == before  # purity: input never mutated
+
+
+def test_persona_hygiene_off_keeps_identity_fields(rotator):
+    opt = build(rotator)  # PERSONA_HYGIENE defaults off
+    payload = chat_payload(
+        [{"role": "user", "content": "hi"}],
+        user="end-user-123",
+        metadata={"user_id": "abc"},
+    )
+
+    out = opt.optimize_context(payload, path="v1/chat/completions")
+
+    assert out.get("user") == "end-user-123"
+    assert out.get("metadata") == {"user_id": "abc"}
+
+
+def test_persona_hygiene_runs_even_when_compression_disabled(rotator):
+    """Unlinkability is a privacy property, not an optimization: stripping
+    applies even with ENABLE_CONTEXT_COMPRESSION off."""
+    opt = build(rotator, persona_hygiene=True, enabled=False)
+    payload = chat_payload([{"role": "user", "content": "hi"}], user="u-1")
+
+    out = opt.optimize_context(payload, path="v1/chat/completions")
+
+    assert "user" not in out
+    assert out is not payload
+
+
+def test_persona_hygiene_non_chat_paths_untouched(rotator):
+    opt = build(rotator, persona_hygiene=True)
+    payload = {"model": "text-embedding-3-small",
+               "input": "hi", "user": "end-user-123"}
+
+    result = opt.optimize_context(payload, path="v1/embeddings")
+
+    assert result is payload  # same object, nothing stripped
+
+
+def test_persona_hygiene_strips_without_messages(rotator):
+    """A chat path with no message array still gets identity fields removed —
+    the stage runs before the pipeline's messages gate."""
+    opt = build(rotator, persona_hygiene=True, enabled=False)
+    payload = {"model": "gpt-4o", "user": "u-1"}
+
+    out = opt.optimize_context(payload, path="v1/chat/completions")
+
+    assert out == {"model": "gpt-4o"}
+
+
 def test_dedup_collapses_consecutive_duplicates_only(rotator):
     opt = build(rotator)
     msgs = [
