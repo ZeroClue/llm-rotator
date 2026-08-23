@@ -367,6 +367,10 @@ class HealthLedger:
     usability queries. Nodes carry no failure state themselves.
     """
 
+    # Headroom opinions from providers that omit reset headers live this
+    # long before being treated as refilled (issue #48).
+    BUDGET_DEFAULT_TTL = 60.0
+
     def __init__(self, nodes, cooldown_base, cooldown_max, lock=None,
                  budget_low_pct=25.0):
         self._cooldown_base = cooldown_base
@@ -456,13 +460,16 @@ class HealthLedger:
 
     def record_quota(self, node, remaining_pct, reset_seconds=None, now=None):
         """Store upstream-reported headroom (issue #48). reset_seconds starts
-        the window after which the budget is considered refilled."""
+        the window after which the budget is considered refilled; providers
+        that omit reset headers get a short default TTL so a stale headroom
+        opinion can never outlive the traffic that produced it."""
         if now is None:
             now = time.monotonic()
         with self._lock:
             self._entry(node)["budget"] = {
                 "pct": max(0.0, min(100.0, float(remaining_pct))),
-                "reset_at": None if reset_seconds is None else now + reset_seconds,
+                "reset_at": now + (self.BUDGET_DEFAULT_TTL if reset_seconds is None
+                                   else reset_seconds),
             }
 
     def _live_budget(self, node, now):

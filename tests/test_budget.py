@@ -70,6 +70,27 @@ def test_successful_response_records_headroom(rotator):
     assert ledger.budget_class(node, now=500.0) is None
 
 
+def test_budget_survives_headerless_success_but_expires_without_reset(rotator):
+    """A success without quota headers keeps the previous opinion; an
+    opinion from a provider that omits reset headers expires on the default
+    TTL instead of living forever (a starved node must be able to recover)."""
+    node = rotator.Node(node_id=1, proxy="socks5h://n1:1080", api_key="k")
+    with_headers = FakeResponse(status=200, content=b"ok", headers={
+        "x-ratelimit-limit-requests": "100",
+        "x-ratelimit-remaining-requests": "0",   # depleted
+        # no reset header -> default TTL
+    })
+    plain = FakeResponse(status=200, content=b"ok")
+    t, ledger, _, _ = make_budget_transport(
+        rotator, [node], [with_headers, plain])
+
+    t.send("POST", "http://up.test/v1/chat/completions", headers={})
+    t.send("POST", "http://up.test/v1/chat/completions", headers={})
+
+    assert ledger.budget_class(node, now=130.0) == "depleted"  # survived
+    assert ledger.budget_class(node, now=200.0) is None        # TTL expired
+
+
 def test_selector_prefers_headroom_but_keeps_cursor_order_within_class(rotator):
     nodes = [
         rotator.Node(node_id=1, proxy="socks5h://n1:1080", api_key="k1"),
