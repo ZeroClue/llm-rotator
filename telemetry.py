@@ -47,6 +47,9 @@ class Telemetry:
         ends (update-in-place, spec §4.3)."""
         entry = {
             "ts": self._clock(),
+            # Wall-clock twin for UI display ("absolute on hover") — the
+            # monotonic ts orders the ring but can't render a date.
+            "wall_ts": time.time(),
             "request_id": request_id,
             "method": method,
             "path": path,

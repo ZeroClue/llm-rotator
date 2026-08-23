@@ -1,0 +1,48 @@
+<div id="requests" hx-get="/admin/fragments/requests" hx-trigger="every 5s"
+     hx-swap="outerHTML">
+  <h2>Recent requests</h2>
+  {% if not requests %}
+  <p class="dim">No requests proxied yet.</p>
+  {% else %}
+  <table class="nodes requests">
+    <tr>
+      <th>when</th><th>method / path</th><th>request id</th><th>node</th>
+      <th>outcome</th><th>duration</th><th>tokens</th><th></th>
+    </tr>
+    {% for r in requests %}
+    <tr class="{{ 'failed-row' if r.outcome != 'ok' }}">
+      <td title="{{ datetime_from(r.wall_ts) }}">{{ relative_ts(r.ts) }}</td>
+      <td>{{ r.method }} <span class="dim">{{ r.path }}</span></td>
+      <td><code class="rid" data-rid="{{ r.request_id }}"
+                title="click to copy">{{ r.request_id[:8] }}</code></td>
+      <td>{% if r.node_id %}#{{ r.node_id }}{% else %}<span class="dim">—</span>{% endif %}</td>
+      <td>{% if r.outcome == 'ok' %}<span class="pill pill-ok">ok</span>
+              {% elif r.outcome == 'single_shot_abort' %}<span class="pill pill-low">aborted</span>
+              {% else %}<span class="pill pill-dep">failed</span>{% endif %}
+          {% if r.status_code %}<span class="dim">{{ r.status_code }}</span>{% endif %}</td>
+      <td>{% if r.total_ms is not none %}{{ "%.0f"|format(r.total_ms) }}ms{% else %}<span class="dim">…</span>{% endif %}</td>
+      <td>{% if r.tokens %}{{ r.tokens.total }}{% else %}<span class="dim">—</span>{% endif %}</td>
+      <td>
+        {% if r.attempts %}
+        <details class="attempts">
+          <summary>{{ r.attempts | length }} attempt{{ "s" if r.attempts | length > 1 }}</summary>
+          <table class="attempt-detail">
+            <tr><th>node</th><th>status</th><th>reason</th><th>ms</th></tr>
+            {% for a in r.attempts %}
+            <tr>
+              <td>#{{ a.node_id }}</td>
+              <td>{{ a.status if a.status is not none else '—' }}</td>
+              <td>{% if a.reason == 'ok' %}<span class="pill pill-ok">ok</span>
+                  {% else %}<span class="pill pill-dep">{{ a.reason }}</span>{% endif %}</td>
+              <td>{{ a.duration_ms }}</td>
+            </tr>
+            {% endfor %}
+          </table>
+        </details>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
