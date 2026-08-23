@@ -12,11 +12,6 @@
 <header>
   <h1>llm-rotator <span class="dim">/ operator</span></h1>
   {% if draining %}<span class="pill pill-dep">draining — shutdown in progress</span>{% endif %}
-  <span class="aggregate">
-    {{ aggregates.requests_last_hour }} req/h ·
-    {{ aggregates.tokens_last_hour }} tokens last hour ·
-    {{ aggregates.tokens_lifetime }} lifetime
-  </span>
   <label class="pause" title="stop/start dashboard polling">
     <input type="checkbox" id="pause-toggle"> pause
   </label>

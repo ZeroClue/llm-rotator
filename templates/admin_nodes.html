@@ -2,6 +2,11 @@
      hx-trigger="every 3s [!document.body.classList.contains('paused')]"
      hx-swap="outerHTML" data-poll-interval="3">
   <h2>Nodes <span class="updated dim">updated 0s ago</span></h2>
+  <p class="aggregate">
+    {{ aggregates.requests_last_hour }} req/h ·
+    {{ aggregates.tokens_last_hour }} tokens last hour ·
+    {{ aggregates.tokens_lifetime }} lifetime
+  </p>
   <div class="gauges">
     <div class="gauge"><div class="v">{{ nodes_available }}/{{ nodes|length }}</div><div class="k">nodes available</div></div>
     <div class="gauge"><div class="v">{{ inflight }}</div><div class="k">in-flight streams</div></div>

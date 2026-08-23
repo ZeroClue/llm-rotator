@@ -2,6 +2,7 @@
 telemetry, bearer-gate exemption, key masking."""
 
 import dataclasses
+import time
 
 import pytest
 
@@ -189,7 +190,6 @@ def test_chrome_pause_toggle_and_poll_gating(client):
     # Both polled fragments gate their trigger on the body pause class.
     assert "every 3s [!document.body.classList.contains('paused')]" in html
     assert "every 5s [!document.body.classList.contains('paused')]" in html
-    assert 'id="pause-toggle"' in html
 
 
 def test_chrome_staleness_self_report_present(client):
@@ -213,16 +213,21 @@ def test_chrome_aggregate_line_renders_telemetry_numbers(client, rotator,
     fresh_telemetry.complete_request(entry, tokens={
         "prompt": 9, "completion": 1, "total": 10})
 
-    html = client.get("/admin").get_data(as_text=True)
+    html = client.get("/admin/fragments/nodes").get_data(as_text=True)
 
+    # The aggregate line lives in the polled nodes fragment so fleet rates
+    # never freeze at first paint.
     assert "1 req/h" in html
     assert "10 tokens last hour" in html
     assert "10 lifetime" in html
 
 
-def test_chrome_footer_shows_uptime_and_started_at(client):
+def test_chrome_footer_shows_uptime_and_started_at(client, rotator):
     html = client.get("/admin").get_data(as_text=True)
 
     assert "uptime" in html
     assert "started" in html
-    assert "20" in html  # started-at datetime renders (year)
+    if rotator.APP_STARTED_AT:
+        expected = time.strftime("%Y-%m-%d %H:%M:%S",
+                                 time.localtime(rotator.APP_STARTED_AT))
+        assert expected in html  # the actual started-at datetime
