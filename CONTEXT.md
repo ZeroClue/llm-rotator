@@ -62,6 +62,17 @@ consults to decide whether a node is usable, and the source health and
 metrics views read. Distinct from the cursor, which only tracks pool
 position.
 
+**Request ring**:
+The process-local bounded log of recent proxied requests — outcome,
+timing, token totals, and per-attempt detail; no bodies, no credentials.
+The dashboard's recent-activity view reads it; it dies with the process.
+
+**Reason buckets**:
+Per-minute, per-node counters over the attempt-outcome taxonomy (ok,
+rate-limited, server-error, timeout, connection, error) plus token sums —
+the 60-minute window behind sparklines, "last failure Nm ago", and rate
+aggregates. Distinct from the health ledger's lifetime totals.
+
 **Never-starve rule**:
 When every node is in cooldown, rotation uses the cursor node anyway rather
 than rejecting the request.

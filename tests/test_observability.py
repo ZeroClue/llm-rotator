@@ -99,7 +99,7 @@ class TestRequestId:
 
         class ExhaustedTransport:
             def send(self, *args, **kwargs):
-                return AllNodesFailed(last_error="boom", attempts=4)
+                return AllNodesFailed(last_error="boom", attempt_count=4, attempts=[])
 
         monkeypatch.setattr(rotator_module, "transport", ExhaustedTransport())
         resp = client.post(
@@ -304,7 +304,7 @@ class TestReviewFixes:
 
         class ExhaustedTransport:
             def send(self, *args, **kwargs):
-                return AllNodesFailed(last_error="boom", attempts=4)
+                return AllNodesFailed(last_error="boom", attempt_count=4, attempts=[])
 
         monkeypatch.setattr(rotator_module, "transport", ExhaustedTransport())
         with caplog.at_level(logging.CRITICAL, logger="rotator"):
@@ -315,7 +315,7 @@ class TestReviewFixes:
             )
         assert resp.status_code == 502
         events = [r for r in caplog.records if getattr(r, "event", None) == "all_nodes_failed"]
-        assert events and events[0].attempts == 4
+        assert events and events[0].attempts == 4  # log extra keeps the count name
         assert events[0].request_id == "corr-x"
 
     def test_token_usage_log_carries_counts(self, client, caplog):
