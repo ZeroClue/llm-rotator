@@ -30,8 +30,9 @@ from dataclasses import dataclass, field, replace
 from flask import Flask, g, request, Response, jsonify, stream_with_context
 from werkzeug.exceptions import HTTPException
 
-from failover import AllNodesFailed, FailoverTransport
+from failover import AllNodesFailed, FailoverTransport, SendResult
 import failover
+from telemetry import Telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +329,8 @@ node_selector = None
 transport = None
 token_optimizer = None
 shutdown_state = None
+telemetry = None
+APP_STARTED_AT = None
 
 
 def assign_request_id():
@@ -605,10 +608,12 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
 
     global settings, OPTIMIZATION_CONFIG, NODE_POOL
     global health_ledger, node_selector, transport, token_optimizer, app
-    global shutdown_state
+    global shutdown_state, telemetry, APP_STARTED_AT
     settings = cfg
     OPTIMIZATION_CONFIG = opt
     NODE_POOL = nodes
+    telemetry = Telemetry()
+    APP_STARTED_AT = time.time()
 
     # One shared reentrant lock keeps ledger updates atomic with selection.
     _ledger_lock = threading.RLock()
@@ -1525,6 +1530,7 @@ def dynamic_failover_proxy(path):
                "method": method, "path": path, "streaming": stream_upstream},
     )
 
+    send_started = time.perf_counter()
     result = transport.send(
         method=method,
         url=url,
@@ -1535,12 +1541,32 @@ def dynamic_failover_proxy(path):
         canonical=parsed_payload if isinstance(parsed_payload, dict) else None,
     )
 
+    # Telemetry (spec §4): every attempt lands in the reason buckets; one
+    # ring entry per request, completed in place for streamed responses.
+    for attempt in result.attempts:
+        telemetry.record_outcome(attempt["node_id"], attempt["reason"])
+    single_shot_abort = (method == "POST" and not settings.retry_posts
+                         and isinstance(result, AllNodesFailed))
+    ring_entry = telemetry.record_request(
+        request_id=request_id,
+        method=method,
+        path=f"/v1/{path}",
+        node_id=result.node_id if isinstance(result, SendResult) else None,
+        outcome=("single_shot_abort" if single_shot_abort
+                 else "failed" if isinstance(result, AllNodesFailed)
+                 else "ok"),
+        status_code=result.status_code if isinstance(result, SendResult) else None,
+        attempts=result.attempts,
+    )
+    elapsed_ms = lambda: (time.perf_counter() - send_started) * 1000  # noqa: E731
+
     if isinstance(result, AllNodesFailed):
+        telemetry.complete_request(ring_entry, total_ms=elapsed_ms())
         logger.critical(
-            f"All retry attempts exhausted ({result.attempts} attempt(s), "
+            f"All retry attempts exhausted ({result.attempt_count} attempt(s), "
             f"MAX_RETRIES={settings.max_retries}). Last error: {result.last_error}",
             extra={"event": "all_nodes_failed", "request_id": request_id,
-                   "attempts": result.attempts, "max_retries": settings.max_retries},
+                   "attempts": result.attempt_count, "max_retries": settings.max_retries},
         )
         return Response(
             json.dumps({
@@ -1556,15 +1582,35 @@ def dynamic_failover_proxy(path):
         )
 
     if stream_upstream:
+        def _timed_stream(chunks, entry):
+            """Spec §4.3: TTFB = first chunk available to forward; total =
+            last byte. Streamed token usage is not parsed in v1."""
+            first = True
+            try:
+                for chunk in chunks:
+                    if first:
+                        first = False
+                        telemetry.complete_request(
+                            entry, ttfb_ms=elapsed_ms())
+                    yield chunk
+            finally:
+                telemetry.complete_request(entry, total_ms=elapsed_ms())
+
         return Response(
-            guarded_stream(result.body(), state=shutdown_state,
-                           request_id=request_id),
+            guarded_stream(
+                _timed_stream(result.body(), ring_entry),
+                state=shutdown_state,
+                request_id=request_id,
+            ),
             result.status_code, result.header_pairs,
         )
 
     body = result.body()
+    telemetry.complete_request(ring_entry, ttfb_ms=elapsed_ms(),
+                               total_ms=elapsed_ms())
     # Log token usage only for buffered JSON bodies; streamed SSE responses
     # returned above never buffer here.
+    usage = None
     if result.status_code == 200 and parsed_payload and isinstance(body, bytes):
         try:
             usage = json.loads(body).get("usage", {})
@@ -1581,6 +1627,12 @@ def dynamic_failover_proxy(path):
                 )
         except Exception:
             pass
+    if usage:
+        telemetry.complete_request(ring_entry, tokens={
+            "prompt": usage.get("prompt_tokens", 0),
+            "completion": usage.get("completion_tokens", 0),
+            "total": usage.get("total_tokens", 0),
+        })
 
     return Response(body, result.status_code, result.header_pairs)
 
@@ -1617,6 +1669,24 @@ def metrics():
         "# HELP llm_rotator_nodes_available Nodes not currently in cooldown.",
         "# TYPE llm_rotator_nodes_available gauge",
         f"llm_rotator_nodes_available {available}",
+        "# HELP llm_rotator_node_attempts_total Lifetime upstream attempts per node and reason.",
+        "# TYPE llm_rotator_node_attempts_total counter",
+    ])
+    for nid, reasons in sorted(telemetry.lifetime_attempts().items()):
+        for reason in sorted(reasons):
+            lines.append(
+                f'llm_rotator_node_attempts_total{{node_id="{nid}",reason="{reason}"}} '
+                f'{reasons[reason]}'
+            )
+    lines.extend([
+        "# HELP llm_rotator_streams_inflight Currently open streamed responses.",
+        "# TYPE llm_rotator_streams_inflight gauge",
+        f"llm_rotator_streams_inflight "
+        f"{shutdown_state.inflight if shutdown_state else 0}",
+        "# HELP llm_rotator_uptime_seconds Seconds since the app was built.",
+        "# TYPE llm_rotator_uptime_seconds gauge",
+        f"llm_rotator_uptime_seconds "
+        f"{time.time() - APP_STARTED_AT if APP_STARTED_AT else 0:.0f}",
     ])
     return Response("\n".join(lines) + "\n", mimetype="text/plain")
 

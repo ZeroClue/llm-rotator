@@ -140,7 +140,12 @@ def test_retry_posts_disabled_gives_post_exactly_one_attempt(rotator, mode):
     result = t.send("POST", "http://up.test/v1/chat/completions", headers={})
 
     assert isinstance(result, failover.AllNodesFailed)
-    assert result.attempts == 1
+    assert result.attempt_count == 1
+    expected_reason = {"502": "server_error", "timeout": "timeout",
+                       "connection_error": "connection",
+                       "request_exception": "error"}[mode]
+    assert result.attempts[0]["reason"] == expected_reason
+    assert result.attempts[0]["node_id"] == 1
     assert session.call_count == 1  # no failover attempt
     assert sleeper.sleeps == []     # no pacing
     assert not ledger.usable(nodes[0])  # outcome still recorded
@@ -159,7 +164,8 @@ def test_all_nodes_failed_reports_true_attempt_count(rotator):
     result = t.send("GET", "http://up.test/v1", headers={})
 
     assert isinstance(result, failover.AllNodesFailed)
-    assert result.attempts == 3
+    assert result.attempt_count == 3
+    assert [a["node_id"] for a in result.attempts] == [1, 2, 1]
 
 
 def test_429_records_cooldown_and_retries_on_next_node(rotator):
@@ -530,3 +536,34 @@ def test_parse_retry_after_variants(rotator):
     assert failover.parse_retry_after("-1") is None
     assert failover.parse_retry_after("soon") is None
     assert failover.parse_retry_after(None) is None
+
+
+# ── Attempts seam (issue #61) ────────────────────────────────────────────────
+
+def test_attempts_carry_reasons_on_success_after_429(rotator):
+    r429 = FakeResponse(status=429)
+    rok = FakeResponse(status=200, content=b"ok")
+    t, *_ , session = make_transport(rotator, [r429, rok])
+
+    result = t.send("POST", "http://up.test/v1/chat/completions", headers={})
+
+    assert isinstance(result, failover.SendResult)
+    assert [(a["node_id"], a["reason"]) for a in result.attempts] == \
+        [(1, "rate_limited"), (2, "ok")]
+    assert result.attempts[0]["status"] == 429
+    assert result.attempts[1]["status"] == 200
+    for attempt in result.attempts:
+        assert isinstance(attempt["duration_ms"], float)
+
+
+def test_attempts_reason_for_timeout(rotator):
+    t, *_ , session = make_transport(
+        rotator, [requests.Timeout("stalled"),
+                  FakeResponse(status=200, content=b"ok")])
+
+    result = t.send("GET", "http://up.test/v1/models", headers={})
+
+    assert isinstance(result, failover.SendResult)
+    assert result.attempts[0]["reason"] == "timeout"
+    assert result.attempts[0]["status"] is None
+    assert result.attempts[1]["reason"] == "ok"

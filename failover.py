@@ -298,6 +298,8 @@ class SendResult:
     node_id: int
     _response: requests.Response = field(repr=False)
     _streamed: bool = field(repr=False)
+    # Per-attempt detail (spec §4.2): {node_id, status, reason, duration_ms}.
+    attempts: list = field(default_factory=list)
 
     def body(self):
         if self._streamed:
@@ -319,7 +321,9 @@ class SendResult:
 @dataclass
 class AllNodesFailed:
     last_error: str | None
-    attempts: int = 0
+    attempt_count: int = 0
+    # Per-attempt detail (spec §4.2): {node_id, status, reason, duration_ms}.
+    attempts: list = field(default_factory=list)
 
 
 class FailoverTransport:
@@ -385,6 +389,15 @@ class FailoverTransport:
         self._sessions = {}
         self._sessions_lock = threading.Lock()
 
+    def _record_attempt(self, log, node, reason, status, started):
+        """One attempt-log row (spec §4.2); durations ride the clock seam."""
+        log.append({
+            "node_id": node.node_id,
+            "status": status,
+            "reason": reason,
+            "duration_ms": round((self.clock() - started) * 1000, 1),
+        })
+
     def _session_for(self, node):
         """The session for one attempt: the shared default unless a
         session_factory was provided, in which case one lazily-built session
@@ -412,6 +425,7 @@ class FailoverTransport:
         single_shot_post = method.upper() == "POST" and not self.retry_posts
         sticky_node = None      # same-persona retry target after a short wait
         redistributed = False   # cross-persona replay: at most once per request
+        attempt_log = []        # per-attempt detail for the telemetry ring
         for attempt in range(self.max_retries):
             if sticky_node is not None:
                 # Deliberately bypasses the cooldown ledger: we just waited
@@ -453,6 +467,9 @@ class FailoverTransport:
 
             retry_after = None
             failed = False
+            reason = None
+            status_code = None
+            attempt_started = self.clock()
             next_action = ("not retrying: RETRY_POSTS=false" if single_shot_post
                            else "Retrying...")
             failure_extras = lambda reason, **kw: {  # noqa: E731
@@ -478,6 +495,7 @@ class FailoverTransport:
                 last_error = f"Timeout: {str(e)}"
                 self.ledger.record_failure(node)
                 failed = True
+                reason = "timeout"
             except ConnectionError as e:
                 logger.error(
                     f"Connection error on Node {node.node_id}: {str(e)}. {next_action}",
@@ -486,6 +504,7 @@ class FailoverTransport:
                 last_error = f"Connection error: {str(e)}"
                 self.ledger.record_failure(node)
                 failed = True
+                reason = "connection"
             except RequestException as e:
                 logger.error(
                     f"Request failed on Node {node.node_id}: {str(e)}. {next_action}",
@@ -494,8 +513,12 @@ class FailoverTransport:
                 last_error = f"Request error: {str(e)}"
                 self.ledger.record_failure(node)
                 failed = True
+                reason = "error"
             else:
+                status_code = response.status_code
                 if response.status_code in RETRY_STATUSES:
+                    reason = ("rate_limited" if response.status_code == 429
+                              else "server_error")
                     logger.warning(
                         f"Node {node.node_id} returned HTTP {response.status_code}. "
                         f"{next_action}",
@@ -557,10 +580,13 @@ class FailoverTransport:
                                        "reason": "retry_after_too_long"},
                             )
                 else:
+                    reason = "ok"
                     self.ledger.record_success(node)
                     quota = parse_quota_headers(response.headers)
                     if quota:
                         self.ledger.record_quota(node, now=self.clock(), **quota)
+                    self._record_attempt(attempt_log, node, reason,
+                                         status_code, attempt_started)
                     return SendResult(
                         status_code=response.status_code,
                         header_pairs=[
@@ -570,10 +596,17 @@ class FailoverTransport:
                         node_id=node.node_id,
                         _response=response,
                         _streamed=stream,
+                        attempts=attempt_log,
                     )
 
+            if failed:
+                self._record_attempt(attempt_log, node, reason,
+                                     status_code, attempt_started)
+
             if single_shot_post and failed:
-                return AllNodesFailed(last_error=last_error, attempts=attempts)
+                return AllNodesFailed(last_error=last_error,
+                                      attempt_count=attempts,
+                                      attempts=attempt_log)
 
             if attempt < self.max_retries - 1:
                 if sticky_node is not None:
@@ -586,4 +619,5 @@ class FailoverTransport:
                     backoff_max=self.backoff_max,
                 ))
 
-        return AllNodesFailed(last_error=last_error, attempts=attempts)
+        return AllNodesFailed(last_error=last_error, attempt_count=attempts,
+                              attempts=attempt_log)

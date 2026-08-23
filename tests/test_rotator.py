@@ -98,6 +98,49 @@ def test_persona_hygiene_strips_payload_fields_end_to_end(client, chat_captures,
     assert sent["messages"] == BASIC_MESSAGES  # messages untouched
 
 
+def test_proxied_request_lands_in_ring_with_tokens_and_attempts(
+        client, rotator, monkeypatch):
+    # Fresh telemetry: the shared app accumulates ring/bucket state across
+    # the suite's earlier requests, and this test asserts exact counts.
+    from telemetry import Telemetry
+    monkeypatch.setattr(rotator, "telemetry", Telemetry())
+
+    resp = client.post("/v1/chat/completions",
+                       json={"model": "gpt-4o", "messages": BASIC_MESSAGES})
+    assert resp.status_code == 200
+
+    entry = rotator.telemetry.ring_snapshot()[0]
+    assert entry["outcome"] == "ok"
+    assert entry["node_id"] == 2
+    assert entry["path"] == "/v1/chat/completions"
+    assert entry["status_code"] == 200
+    assert entry["ttfb_ms"] is not None and entry["total_ms"] is not None
+    assert entry["tokens"]["total"] == 10  # mock usage: 9+1
+    # Node 1 is the fixture's dead port: the request fails over to node 2.
+    assert [(a["node_id"], a["reason"]) for a in entry["attempts"]] == \
+        [(1, "connection"), (2, "ok")]
+
+    # Reason buckets fed per attempt; tokens in the current minute bucket.
+    window = rotator.telemetry.node_window(2)
+    assert window[-1]["ok"] == 1
+    assert window[-1]["tokens"] == 10
+    aggregates = rotator.telemetry.aggregates()
+    assert aggregates["tokens_lifetime"] >= 10
+
+
+def test_streamed_request_completes_ring_entry_in_place(client, rotator):
+    resp = client.post("/v1/chat/completions",
+                       json={"model": "gpt-4o", "messages": BASIC_MESSAGES,
+                             "stream": True})
+    assert resp.status_code == 200
+    assert b"part0" in resp.get_data()  # stream fully consumed
+
+    entry = rotator.telemetry.ring_snapshot()[0]
+    assert entry["outcome"] == "ok"
+    assert entry["ttfb_ms"] is not None
+    assert entry["total_ms"] >= entry["ttfb_ms"]
+
+
 def test_explicit_prompt_caching_adds_valid_markers(client, chat_captures, make_optimizer):
     make_optimizer(enable_prompt_caching=True)
     resp = client.post("/v1/chat/completions", json={"model": "gpt-4o", "messages": BASIC_MESSAGES})
