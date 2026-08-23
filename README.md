@@ -156,6 +156,8 @@ index and silently drops later nodes.
 |----------|----------|-------------|
 | `PROXY_N_URL` | ✅ | Egress URL, e.g. `socks5h://100.64.0.1:1055` (`socks5h` = DNS resolved remotely) |
 | `API_KEY_N` | ✅ | API key injected as `Authorization: Bearer …` for node N |
+| `PERSONA_N_USER_AGENT` | — | Override node N's persona User-Agent; default is a stable per-node pick from curated API-client stacks (ADR 0002). The persona UA always replaces the client's |
+| `PERSONA_N_FINGERPRINT` | — | Override node N's transport fingerprint label (consumed by the optional curl_cffi transport); default derived like the User-Agent. Must not be empty when set |
 
 ### Gunicorn (`gunicorn.conf.py`)
 

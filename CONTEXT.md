@@ -12,6 +12,14 @@ identified by `node_id`, a stable 1-based integer fixed when the pool is built.
 A node carries no failure history itself; that lives in the health ledger.
 _Avoid_: upstream, backend, host
 
+**Persona**:
+The client identity a node consistently presents upstream — its User-Agent
+and transport fingerprint, derived from a stable hash of `node_id` over
+curated API-client stacks (overridable via `PERSONA_N_*`). Every observable
+identity attribute moves with the persona and never mixes across nodes; see
+ADR 0002 for what this can and cannot hide.
+_Avoid_: profile, identity (too broad), disguise
+
 **Egress**:
 The network path (a Tailscale SOCKS5 endpoint) a request travels through to
 reach the LLM provider. Each node has exactly one.
