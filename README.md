@@ -143,6 +143,10 @@ index and silently drops later nodes.
 | `NODE_COOLDOWN_BASE` | `2.0` | First-failure cooldown (seconds); doubles per consecutive failure |
 | `NODE_COOLDOWN_MAX` | `60.0` | Cooldown cap (seconds) |
 | `RETRY_POSTS` | `true` | `false` gives POSTs exactly one attempt — a 504/timeout may mean the upstream completed, so verbatim retries can double-bill |
+| `ANONYMITY_FAILOVER` | `cross` | `same` waits out short 429 `Retry-After`s on the failing persona before allowing one cross-persona replay (byte-identical replays across personas let providers link them); `cross` keeps availability-first rotation |
+| `FAILOVER_MAX_WAIT` | `8.0` | Longest 429 `Retry-After` (seconds) the same-persona ladder will wait out; longer values redistribute instead |
+| `FAILOVER_MAX_WAITERS` | `4` | Cap on threads concurrently parked in same-persona waits |
+| `REDISTRIBUTION_JITTER` | `true` | Re-serialize JSON bodies per attempt with varied framing (semantically identical, byte-different) so no two attempts carry identical bytes |
 | `STREAM_DRAIN_WINDOW` | `20.0` | Graceful-shutdown drain window (seconds from SIGTERM) for in-flight SSE streams: they finish naturally inside it, otherwise they end with a terminal `proxy_shutdown` error event + `[DONE]`. Keep it below **every** outer killer — `GUNICORN_GRACEFUL_TIMEOUT` *and* your container manager's stop grace (`stop_grace_period`, `docker stop -t`, systemd `TimeoutStopSec`); `0` cuts on the next chunk |
 | `DEFAULT_MODEL` | `gpt-4o` | Model used for token counting |
 | `LOG_LEVEL` | `INFO` | Logging level |

@@ -10,8 +10,10 @@ only drives attempts and classifies outcomes.
 """
 
 import http.cookiejar
+import json
 import logging
 import random
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -90,6 +92,27 @@ def compute_backoff(attempt, retry_after=None, rng=random.uniform, *,
     return min(delay, backoff_max)
 
 
+# Deterministic serialization variants cycled per attempt: semantically
+# identical JSON, byte-different wire form. The four forms stay pairwise
+# distinct for any realistic payload (compact/spaced/indented/tab-indented ×
+# key order), so consecutive attempts never carry identical bytes for a
+# provider to hash-link. A provider hashing canonical JSON defeats this
+# entirely (accepted residual risk, ADR 0002).
+_SERIALIZE_VARIANTS = (
+    {"sort_keys": True, "separators": (",", ":")},
+    {"sort_keys": False, "separators": (", ", ": ")},
+    {"sort_keys": True, "indent": 2},
+    {"sort_keys": False, "indent": "\t"},
+)
+
+
+def serialize_attempt(canonical, attempt):
+    return json.dumps(
+        canonical,
+        **_SERIALIZE_VARIANTS[attempt % len(_SERIALIZE_VARIANTS)],
+    ).encode("utf-8")
+
+
 @dataclass
 class SendResult:
     """One successful upstream response.
@@ -140,12 +163,29 @@ class FailoverTransport:
     def __init__(self, selector, ledger, session=None, sleep=time.sleep,
                  rng=random.uniform, max_retries=4, timeout=25.0,
                  backoff_base=0.5, backoff_max=8.0, retry_posts=True,
-                 persona_hygiene=False):
+                 persona_hygiene=False, anonymity_failover="cross",
+                 failover_max_wait=8.0, failover_max_waiters=4,
+                 wait_gate=None, redistribution_jitter=True):
         self.selector = selector
         self.ledger = ledger
         # PERSONA_HYGIENE: also strip client telemetry headers (x-stainless-*,
         # x-app, x-title, http-referer) outbound; see drop_outbound_header.
         self.persona_hygiene = persona_hygiene
+        # "cross" = today's availability-first failover (replays bytes across
+        # personas). "same" = 429s with a short Retry-After wait out on the
+        # SAME persona (what a legitimate single customer does); only then is
+        # a cross-persona replay allowed, at most once per request. Byte
+        # replays across personas are the cheapest linkage oracle there is.
+        if anonymity_failover not in ("same", "cross"):
+            raise ValueError(
+                f"anonymity_failover must be 'same' or 'cross', got {anonymity_failover!r}")
+        self.anonymity_failover = anonymity_failover
+        self.failover_max_wait = failover_max_wait
+        # Bounds threads concurrently parked in same-persona waits so a burst
+        # of 429s cannot pin the whole gthread pool (issue #46).
+        self.wait_gate = wait_gate if wait_gate is not None \
+            else threading.Semaphore(failover_max_waiters)
+        self.redistribution_jitter = redistribution_jitter
         if session is not None:
             self.session = session
         else:
@@ -165,16 +205,29 @@ class FailoverTransport:
         self.retry_posts = retry_posts
 
     def send(self, method, url, headers, payload=b"", stream=False,
-             request_id=None):
+             request_id=None, canonical=None):
         # request_id is pure log context: it rides every attempt record so
         # proxy-side and upstream-attempt lines correlate in one grep.
+        # canonical is the parsed JSON body (when the payload is JSON): every
+        # attempt re-serializes it with varied framing so cross-persona
+        # replays never carry identical bytes.
         log_extras = {"request_id": request_id}
         last_error = None
         attempts = 0
         single_shot_post = method.upper() == "POST" and not self.retry_posts
+        sticky_node = None      # same-persona retry target after a short wait
+        redistributed = False   # cross-persona replay: at most once per request
         for attempt in range(self.max_retries):
-            node = self.selector.select()
+            if sticky_node is not None:
+                # Deliberately bypasses the cooldown ledger: we just waited
+                # out exactly the Retry-After the provider asked for.
+                node, sticky_node = sticky_node, None
+            else:
+                node = self.selector.select()
             attempts += 1
+
+            wire_payload = serialize_attempt(canonical, attempt) \
+                if canonical is not None and self.redistribution_jitter else payload
 
             dropped = [k for k in headers
                        if drop_outbound_header(k, hygiene=self.persona_hygiene)]
@@ -217,7 +270,7 @@ class FailoverTransport:
                     method=method,
                     url=url,
                     headers=request_headers,
-                    data=payload,
+                    data=wire_payload,
                     proxies=proxies,
                     timeout=self.timeout,
                     stream=stream,
@@ -258,6 +311,56 @@ class FailoverTransport:
                     response.close()
                     self.ledger.record_failure(node)
                     failed = True
+
+                    # A 429 is the one failure provably processed-not: the
+                    # provider rejected the request before work, so a replay
+                    # cannot double-bill. In same-persona mode, a short
+                    # Retry-After is waited out on THIS persona — exactly what
+                    # the legitimate single customer the provider throttled
+                    # would do. Only a long/no Retry-After justifies the
+                    # linkage cost of one cross-persona replay.
+                    if (response.status_code == 429
+                            and self.anonymity_failover == "same"
+                            and not single_shot_post):
+                        if (retry_after is not None
+                                and retry_after <= self.failover_max_wait):
+                            if self.wait_gate.acquire(False):
+                                try:
+                                    logger.info(
+                                        f"429 on Node {node.node_id}: waiting "
+                                        f"{retry_after:.1f}s to retry the same persona",
+                                        extra={**log_extras,
+                                               "event": "failover_same_persona_wait",
+                                               "node_id": node.node_id,
+                                               "wait_seconds": retry_after},
+                                    )
+                                    self.sleep(retry_after)
+                                    sticky_node = node
+                                finally:
+                                    self.wait_gate.release()
+                            else:
+                                # Gate full: this rotation IS the request's
+                                # cross-persona hop — consume the budget so a
+                                # later above-threshold 429 cannot replay again.
+                                redistributed = True
+                                logger.warning(
+                                    f"429 on Node {node.node_id}: waiter cap hit, "
+                                    "rotating to another persona without waiting",
+                                    extra={**log_extras,
+                                           "event": "failover_redistribute",
+                                           "node_id": node.node_id,
+                                           "reason": "waiter_cap"},
+                                )
+                        elif not redistributed:
+                            redistributed = True
+                            logger.info(
+                                f"429 on Node {node.node_id}: redistributing once "
+                                "via another persona (Retry-After too long to wait)",
+                                extra={**log_extras,
+                                       "event": "failover_redistribute",
+                                       "node_id": node.node_id,
+                                       "reason": "retry_after_too_long"},
+                            )
                 else:
                     self.ledger.record_success(node)
                     return SendResult(
@@ -275,6 +378,8 @@ class FailoverTransport:
                 return AllNodesFailed(last_error=last_error, attempts=attempts)
 
             if attempt < self.max_retries - 1:
+                if sticky_node is not None:
+                    continue  # the ladder already waited; no backoff on top
                 self.sleep(compute_backoff(
                     attempt,
                     retry_after,

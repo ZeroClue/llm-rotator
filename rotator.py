@@ -92,9 +92,24 @@ class Settings:
     # safety_identifier) from chat payloads. The credential/organization
     # header drops are unconditional and unaffected by this flag.
     persona_hygiene: bool = False
+    # Failover ladder (issue #46): "same" waits out a short 429 Retry-After
+    # on the failing persona and only then allows one cross-persona replay;
+    # "cross" keeps today's availability-first rotation. A byte-identical
+    # replay across personas is the cheapest linkage oracle there is.
+    anonymity_failover: str = "cross"
+    failover_max_wait: float = 8.0
+    # Cap on threads concurrently parked in same-persona waits so a burst of
+    # 429s cannot pin the whole gthread pool.
+    failover_max_waiters: int = 4
+    redistribution_jitter: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
+        anonymity_failover = os.getenv("ANONYMITY_FAILOVER", "cross")
+        if anonymity_failover not in ("same", "cross"):
+            raise ValueError(
+                f"ANONYMITY_FAILOVER must be 'same' or 'cross', "
+                f"got {anonymity_failover!r}")
         return cls(
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             bind_host=os.getenv("PROXY_BIND_HOST", "127.0.0.1"),
@@ -112,6 +127,11 @@ class Settings:
             auth_token=os.getenv("PROXY_AUTH_TOKEN", ""),
             log_format=os.getenv("LOG_FORMAT", "text"),
             persona_hygiene=_env_bool(os.getenv("PERSONA_HYGIENE", "false")),
+            anonymity_failover=anonymity_failover,
+            failover_max_wait=float(os.getenv("FAILOVER_MAX_WAIT", "8.0")),
+            failover_max_waiters=int(os.getenv("FAILOVER_MAX_WAITERS", "4")),
+            redistribution_jitter=_env_bool(
+                os.getenv("REDISTRIBUTION_JITTER", "true")),
         )
 
 
@@ -520,7 +540,12 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
         backoff_max=cfg.retry_backoff_max,
         retry_posts=cfg.retry_posts,
         persona_hygiene=cfg.persona_hygiene,
+        anonymity_failover=cfg.anonymity_failover,
+        failover_max_wait=cfg.failover_max_wait,
+        failover_max_waiters=cfg.failover_max_waiters,
+        redistribution_jitter=cfg.redistribution_jitter,
     )
+
 
     token_optimizer = TokenOptimizer(
         config=opt, model_name=cfg.default_model, persona_hygiene=cfg.persona_hygiene
@@ -1397,6 +1422,7 @@ def dynamic_failover_proxy(path):
         payload=payload,
         stream=stream_upstream,
         request_id=request_id,
+        canonical=parsed_payload if isinstance(parsed_payload, dict) else None,
     )
 
     if isinstance(result, AllNodesFailed):
