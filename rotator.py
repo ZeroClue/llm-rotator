@@ -85,6 +85,12 @@ class Settings:
     # "text" keeps the classic human format; "json" emits one structured
     # object per line (see JsonFormatter).
     log_format: str = "text"
+    # Persona hygiene: additionally strip client telemetry headers
+    # (x-stainless-*, x-app, x-title, http-referer) outbound and remove
+    # provider identity fields (user/metadata/prompt_cache_key/
+    # safety_identifier) from chat payloads. The credential/organization
+    # header drops are unconditional and unaffected by this flag.
+    persona_hygiene: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -104,6 +110,7 @@ class Settings:
             default_model=os.getenv("DEFAULT_MODEL", "gpt-4o"),
             auth_token=os.getenv("PROXY_AUTH_TOKEN", ""),
             log_format=os.getenv("LOG_FORMAT", "text"),
+            persona_hygiene=_env_bool(os.getenv("PERSONA_HYGIENE", "false")),
         )
 
 
@@ -457,9 +464,12 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
         backoff_base=cfg.retry_backoff_base,
         backoff_max=cfg.retry_backoff_max,
         retry_posts=cfg.retry_posts,
+        persona_hygiene=cfg.persona_hygiene,
     )
 
-    token_optimizer = TokenOptimizer(config=opt, model_name=cfg.default_model)
+    token_optimizer = TokenOptimizer(
+        config=opt, model_name=cfg.default_model, persona_hygiene=cfg.persona_hygiene
+    )
 
     # Shutdown draining: armed by the signal handlers installed below; the
     # streamed view consults it between chunks (see guarded_stream).
@@ -587,6 +597,13 @@ class OptimizationConfig:
         return replace(base, **overrides)
 
 
+# Top-level chat-payload fields that exist to carry end-user/account identity
+# upstream; removed when PERSONA_HYGIENE is on (see _strip_identity_fields).
+_IDENTITY_PAYLOAD_FIELDS = frozenset(
+    {"user", "metadata", "prompt_cache_key", "safety_identifier"}
+)
+
+
 class TokenOptimizer:
     """
     Modular token-management pipeline applied to chat/completions payloads.
@@ -612,10 +629,16 @@ class TokenOptimizer:
     - Provider-specific token calculations
     """
 
-    def __init__(self, config=None, model_name="gpt-4o"):
+    def __init__(self, config=None, model_name="gpt-4o", persona_hygiene=False):
         self.config = config if config is not None else OptimizationConfig()
         self.model_name = model_name
         self.summarization_model = self.config.summarization_model
+        # PERSONA_HYGIENE payload stage: strip provider identity fields
+        # (user/metadata/prompt_cache_key/safety_identifier) from chat
+        # payloads. Injected from Settings here rather than living on
+        # OptimizationConfig so the flag is parsed from the environment in
+        # exactly one place and header/payload hygiene can never diverge.
+        self.persona_hygiene = persona_hygiene
         
         # Initialize tiktoken encoder
         if TIKTOKEN_AVAILABLE:
@@ -698,12 +721,22 @@ class TokenOptimizer:
         The returned payload's max_tokens may be clamped down to fit the
         remaining context budget (client value wins whenever it fits);
         clamping is logged.
+
+        Persona hygiene (PERSONA_HYGIENE) runs ahead of the enabled gate:
+        provider identity fields are stripped even when token compression
+        is disabled, because unlinkability is a privacy property, not an
+        optimization.
         """
         cfg = self.config
-        if not cfg.enabled or not path.endswith("chat/completions"):
+        if not path.endswith("chat/completions") or not isinstance(payload, dict):
             return payload
 
-        messages = payload.get("messages") if isinstance(payload, dict) else None
+        payload = self._strip_identity_fields(payload)
+
+        if not cfg.enabled:
+            return payload
+
+        messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
             return payload
 
@@ -713,6 +746,25 @@ class TokenOptimizer:
         except Exception:
             logger.exception("Context optimization failed; forwarding payload unoptimized")
             return payload
+
+    def _strip_identity_fields(self, payload: dict) -> dict:
+        """Persona-hygiene payload stage: remove fields that exist to carry
+        end-user/account identity upstream (OpenAI's user/safety_identifier/
+        prompt_cache_key, metadata.user_id). Copy-on-write like every stage;
+        when disabled or nothing matches, the input object comes back
+        untouched."""
+        if not self.persona_hygiene:
+            return payload
+        present = _IDENTITY_PAYLOAD_FIELDS.intersection(payload)
+        if not present:
+            return payload
+        logger.info(
+            "Stripped identity fields from chat payload: "
+            + ", ".join(sorted(present)),
+            extra={"event": "payload_hygiene", "count": len(present),
+                   "fields": sorted(present)},
+        )
+        return {k: v for k, v in payload.items() if k not in _IDENTITY_PAYLOAD_FIELDS}
 
     def _optimize(self, payload: dict, messages: list, is_streaming: bool) -> dict:
         cfg = self.config
