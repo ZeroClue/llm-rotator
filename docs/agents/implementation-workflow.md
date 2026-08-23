@@ -32,14 +32,19 @@ this workflow overrides it.
    (playwright-cli for UI, curl for APIs) before merging. Unit tests green is
    necessary, not sufficient. Whether a change is user-facing follows from the
    issue's acceptance criteria, not the diff's size.
-7. **Merge** — Once gates 4–6 pass:
+7. **CI green before merge** — `gh run list --branch <branch>` (or the PR
+   checks) must show the latest run passing. Merging red hides the failure on
+   main and pins every later bisect (PRs #65-#68 merged red; the container
+   smoke test had been failing for days before anyone looked). If CI is red,
+   the PR is not done.
+8. **Merge** — Once gates 4–7 pass:
    `gh pr merge --squash --delete-branch`.
-8. **Close tickets** — Issues linked with `Closes #N` auto-close on merge;
+9. **Close tickets** — Issues linked with `Closes #N` auto-close on merge;
    close stragglers per `docs/agents/issue-tracker.md`. An issue counts as
    done only when its acceptance criteria are verified in code on `main`
    (read/grep/build/test). Partial work: keep the issue open, note progress in
    a comment, split remaining criteria into focused issues.
-9. **Update CONTEXT.md** — If domain terms or decisions changed during
-   implementation, update `CONTEXT.md` and add an ADR if the decision is hard
-   to reverse. Gate: every domain term in the merged diff matches the
-   `CONTEXT.md` glossary; every hard-to-reverse decision has an ADR.
+10. **Update CONTEXT.md** — If domain terms or decisions changed during
+    implementation, update `CONTEXT.md` and add an ADR if the decision is hard
+    to reverse. Gate: every domain term in the merged diff matches the
+    `CONTEXT.md` glossary; every hard-to-reverse decision has an ADR.
