@@ -31,6 +31,7 @@ from flask import Flask, g, request, Response, jsonify, stream_with_context
 from werkzeug.exceptions import HTTPException
 
 from failover import AllNodesFailed, FailoverTransport
+import failover
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,11 @@ class Settings:
     # 429s cannot pin the whole gthread pool.
     failover_max_waiters: int = 4
     redistribution_jitter: bool = True
+    # Outbound transport (issue #47): "curl_cffi" enables the fingerprint-
+    # capable libcurl adapter (optional dependency; startup fails loudly if
+    # it is not installed). "requests" keeps the historical h1.1 stack, in
+    # which only the persona User-Agent half is observable.
+    transport: str = "requests"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -110,6 +116,10 @@ class Settings:
             raise ValueError(
                 f"ANONYMITY_FAILOVER must be 'same' or 'cross', "
                 f"got {anonymity_failover!r}")
+        transport = os.getenv("TRANSPORT", "requests")
+        if transport not in ("requests", "curl_cffi"):
+            raise ValueError(
+                f"TRANSPORT must be 'requests' or 'curl_cffi', got {transport!r}")
         return cls(
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             bind_host=os.getenv("PROXY_BIND_HOST", "127.0.0.1"),
@@ -132,6 +142,7 @@ class Settings:
             failover_max_waiters=int(os.getenv("FAILOVER_MAX_WAITERS", "4")),
             redistribution_jitter=_env_bool(
                 os.getenv("REDISTRIBUTION_JITTER", "true")),
+            transport=transport,
         )
 
 
@@ -606,6 +617,17 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
 
     # Retry/failover transport: session/sleeper/rng default to production
     # adapters inside the module.
+    if cfg.transport == "curl_cffi":
+        try:
+            import curl_cffi  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "TRANSPORT=curl_cffi requires the optional dependency "
+                "curl_cffi (pip install curl_cffi); refusing to silently "
+                "degrade the persona fingerprint layer") from exc
+        session_factory = failover.CurlCffiSessionAdapter
+    else:
+        session_factory = None
     transport = FailoverTransport(
         selector=node_selector,
         ledger=health_ledger,
@@ -619,6 +641,7 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
         failover_max_wait=cfg.failover_max_wait,
         failover_max_waiters=cfg.failover_max_waiters,
         redistribution_jitter=cfg.redistribution_jitter,
+        session_factory=session_factory,
     )
 
 

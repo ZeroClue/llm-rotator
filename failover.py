@@ -155,6 +155,88 @@ def parse_quota_headers(headers):
             "reset_seconds": reset_seconds}
 
 
+# ── curl_cffi transport adapter (issue #47) ──────────────────────────────────
+def resolve_impersonation(fingerprint):
+    """Persona fingerprint label -> curl_cffi session kwargs. 'ja3:<spec>'
+    and 'akamai:<spec>' pass raw custom fingerprints through; any other
+    non-empty value is treated as a curl_cffi impersonate target name
+    (e.g. 'chrome124'); empty means plain libcurl — still one consistent
+    stack per persona. The curated stack LABELS (okhttp-android etc.) are
+    deliberately NOT valid curl_cffi targets: pretending to okhttp with an
+    unverified JA3 stands out more than an honest consistent client, so
+    real diversity comes from operator-supplied ja3:/akamai: specs."""
+    if not fingerprint:
+        return {}
+    if fingerprint.startswith("ja3:"):
+        return {"ja3": fingerprint[4:].strip()}
+    if fingerprint.startswith("akamai:"):
+        return {"akamai": fingerprint[7:].strip()}
+    return {"impersonate": fingerprint}
+
+
+class _CurlCffiResponse:
+    """The minimal requests.Response surface FailoverTransport.send()
+    consumes, backed by a curl_cffi response."""
+
+    def __init__(self, response):
+        self._response = response
+        self.status_code = response.status_code
+        self._headers = dict(response.headers.items())
+        self.closed = False
+
+    @property
+    def headers(self):
+        return self._headers
+
+    @property
+    def content(self):
+        return self._response.content
+
+    def iter_content(self, chunk_size):
+        try:
+            for chunk in self._response.iter_content(chunk_size=chunk_size):
+                yield chunk
+        finally:
+            self.close()
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self._response.close()
+
+
+class CurlCffiSessionAdapter:
+    """requests.Session-shaped wrapper over curl_cffi, pinned to ONE persona
+    fingerprint for its lifetime (issue #47): impersonating per-request would
+    churn a persona's TLS identity mid-conversation. One instance per
+    fingerprint lives on the transport; cookies are cleared after every
+    exchange because curl_cffi has no refuse-all policy hook like
+    _NoStoreCookiePolicy — same guarantee, blunter mechanism."""
+
+    def __init__(self, fingerprint=""):
+        from curl_cffi import requests as cffi_requests
+        self._fingerprint = fingerprint
+        self._session = cffi_requests.Session(**resolve_impersonation(fingerprint))
+
+    def request(self, method, url, headers=None, data=None, proxies=None,
+                timeout=None, stream=False):
+        response = self._session.request(
+            method=method, url=url, headers=headers, data=data,
+            proxies=proxies, timeout=timeout, stream=stream,
+        )
+        try:
+            self._session.cookies.clear()
+        except Exception:
+            pass
+        return _CurlCffiResponse(response)
+
+    def close(self):
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+
 @dataclass
 class SendResult:
     """One successful upstream response.
@@ -208,7 +290,7 @@ class FailoverTransport:
                  persona_hygiene=False, anonymity_failover="cross",
                  failover_max_wait=8.0, failover_max_waiters=4,
                  wait_gate=None, redistribution_jitter=True,
-                 clock=time.monotonic):
+                 clock=time.monotonic, session_factory=None):
         self.selector = selector
         self.ledger = ledger
         # PERSONA_HYGIENE: also strip client telemetry headers (x-stainless-*,
@@ -249,6 +331,26 @@ class FailoverTransport:
         # gives POSTs exactly one attempt; the ledger still records the
         # outcome so cooldown accounting stays truthful.
         self.retry_posts = retry_posts
+        # Optional per-persona session factory (issue #47): given a persona
+        # fingerprint label, returns a session-like object. When unset, every
+        # attempt rides the single shared session (requests default).
+        self.session_factory = session_factory
+        self._sessions = {}
+        self._sessions_lock = threading.Lock()
+
+    def _session_for(self, node):
+        """The session for one attempt: the shared default unless a
+        session_factory was provided, in which case one lazily-built session
+        per distinct fingerprint — personas never share a stack."""
+        if self.session_factory is None:
+            return self.session
+        key = node.fingerprint or ""
+        with self._sessions_lock:
+            session = self._sessions.get(key)
+            if session is None:
+                session = self.session_factory(key)
+                self._sessions[key] = session
+            return session
 
     def send(self, method, url, headers, payload=b"", stream=False,
              request_id=None, canonical=None):
@@ -312,7 +414,7 @@ class FailoverTransport:
                 "reason": reason, **kw,
             }
             try:
-                response = self.session.request(
+                response = self._session_for(node).request(
                     method=method,
                     url=url,
                     headers=request_headers,
