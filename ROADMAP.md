@@ -235,7 +235,7 @@ Weighted nodes (capacity-based), per-node rate budgets, mid-stream failover is
 impossible by design (document it); consider `max_completion_tokens` passthrough
 for newer OpenAI models alongside legacy `max_tokens`.
 
-### 18. Dashboard / configuration UI — `todo`
+### 18. Dashboard / configuration UI — `done` (2026-08-23, PRs #65-#68)
 A web UI for operating a running proxy: visualize node health and lifetime
 counters (`/health` + `/metrics`), browse requests via their correlation IDs,
 and surface — eventually manage — the env-derived configuration safely.
@@ -244,8 +244,10 @@ operating multi-node pools today means curl + grep. Maintainer wants a proper
 dashboard before any 1.0 claim (2026-08-22).
 *Note:* specced 2026-08-23 — wayfinder map [#39](https://github.com/ZeroClue/llm-rotator/issues/39)
 resolved into [docs/dashboard-spec.md](docs/dashboard-spec.md) (layout verdict:
-variant A status board; backend contract in #41's resolution comment). Build
-decomposition proposed in spec §9; next step is opening the build tickets.
+variant A status board; backend contract in #41's resolution comment). Built
+as four tickets (#61-#64 → PRs #65-#68): telemetry module + attempts seam +
+/metrics parity; /admin page + nodes & config fragments; requests section;
+chrome. Read-only, loopback-trust, zero-build — see the spec for non-goals.
 
 ---
 
