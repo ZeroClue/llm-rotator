@@ -193,7 +193,7 @@ dict without `node_id`. From the 2026-08-21 architecture review.
 rules (record_failure / usable / cooldown_remaining) unit-tested without sleeps
 or HTTP.
 
-### 19. Persona unlinkability — `in progress` (2026-08-23, epic #45)
+### 19. Persona unlinkability — `done` (2026-08-23, epic #45)
 Make the N (egress IP, API key) pairs look like N unrelated customers to provider
 anti-abuse systems; stop leaking one-operator signals (client telemetry headers,
 `x-api-key`/org headers riding upstream, byte-identical cross-persona replays).
