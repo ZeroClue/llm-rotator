@@ -706,9 +706,11 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
             # Telemetry object, not a snapshot: only the requests route pays
             # the ring-copy cost; the 3s nodes poll must not.
             "telemetry": telemetry,
+            "aggregates": telemetry.aggregates(now=now),
             "settings": settings,
             "opt": OPTIMIZATION_CONFIG,
             "uptime_seconds": time.time() - APP_STARTED_AT if APP_STARTED_AT else 0,
+            "started_at": APP_STARTED_AT,
         }
 
     register_admin_dashboard(application, context_provider=_admin_context)

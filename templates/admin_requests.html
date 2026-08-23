@@ -1,6 +1,7 @@
-<div id="requests" hx-get="/admin/fragments/requests" hx-trigger="every 5s"
-     hx-swap="outerHTML">
-  <h2>Recent requests</h2>
+<div id="requests" hx-get="/admin/fragments/requests"
+     hx-trigger="every 5s [!document.body.classList.contains('paused')]"
+     hx-swap="outerHTML" data-poll-interval="5">
+  <h2>Recent requests <span class="updated dim">updated 0s ago</span></h2>
   {% if not requests %}
   <p class="dim">No requests proxied yet.</p>
   {% else %}

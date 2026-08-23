@@ -66,9 +66,11 @@ def register_admin_dashboard(application, *, context_provider):
 
     @bp.route("/admin")
     def admin_page():
-        return render_template("admin.html", **context_provider(),
+        context = context_provider()
+        requests = context.pop("telemetry").ring_snapshot()
+        return render_template("admin.html", requests=requests,
                                cooldown_display=_cooldown_display,
-                               relative_ts=_relative_ts)
+                               relative_ts=_relative_ts, **context)
 
     @bp.route("/admin/fragments/nodes")
     def admin_nodes_fragment():

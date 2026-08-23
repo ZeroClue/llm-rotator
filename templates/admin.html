@@ -12,6 +12,9 @@
 <header>
   <h1>llm-rotator <span class="dim">/ operator</span></h1>
   {% if draining %}<span class="pill pill-dep">draining — shutdown in progress</span>{% endif %}
+  <label class="pause" title="stop/start dashboard polling">
+    <input type="checkbox" id="pause-toggle"> pause
+  </label>
 </header>
 
 <main>
@@ -29,10 +32,36 @@
 </main>
 
 <footer>
-  uptime {{ "%.0f"|format(uptime_seconds) }}s · read-only · loopback-trust
+  uptime {{ "%.0f"|format(uptime_seconds) }}s · started
+  {% if started_at %}{{ datetime_from(started_at) }}{% endif %} ·
+  read-only · loopback-trust
 </footer>
 <script>
-  // Click-to-copy full request ids (zero-build: one inline handler).
+  // Pause toggle: htmx polling triggers are gated on body.paused.
+  document.getElementById("pause-toggle").addEventListener("change", function() {
+    document.body.classList.toggle("paused", this.checked);
+  });
+
+  // Staleness self-report: each fragment records its last swap; a ticker
+  // renders "updated Ns ago" and flags stale past 2× its poll interval.
+  function markUpdated(root) { root.dataset.updatedAt = Date.now(); }
+  document.querySelectorAll("[data-poll-interval]").forEach(markUpdated);
+  document.body.addEventListener("htmx:afterSwap", function(e) {
+    var root = e.detail.target.closest("[data-poll-interval]");
+    if (root) markUpdated(root);
+  });
+  setInterval(function() {
+    document.querySelectorAll("[data-poll-interval]").forEach(function(root) {
+      var span = root.querySelector(".updated");
+      if (!span || !root.dataset.updatedAt) return;
+      var ago = Math.round((Date.now() - root.dataset.updatedAt) / 1000);
+      span.textContent = "updated " + ago + "s ago";
+      root.classList.toggle("stale",
+          ago > parseInt(root.dataset.pollInterval, 10) * 2);
+    });
+  }, 1000);
+
+  // Click-to-copy full request ids (zero-build: one delegated handler).
   document.addEventListener("click", function(e) {
     var el = e.target.closest(".rid");
     if (el && el.dataset.rid) navigator.clipboard.writeText(el.dataset.rid);
