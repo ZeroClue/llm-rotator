@@ -14,8 +14,11 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY rotator.py failover.py gunicorn.conf.py ./
+# Copy application code (dashboard templates/assets included — create_app
+# imports admin_dashboard at startup, so a missing file kills the worker)
+COPY rotator.py failover.py telemetry.py admin_dashboard.py gunicorn.conf.py ./
+COPY templates/ templates/
+COPY static/ static/
 
 # Pre-cache the tiktoken BPE file for the default model so first startup
 # never stalls on a tokenizer download (matters on egress-restricted hosts).
