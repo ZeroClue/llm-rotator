@@ -154,6 +154,10 @@ index and silently drops later nodes.
 | `PROXY_AUTH_TOKEN` | *(empty)* | Optional bearer gate: when set, `/v1/*` requires `Authorization: Bearer <token>` (401 otherwise). `/health`, `/ready`, and `/metrics` stay open |
 | `PERSONA_HYGIENE` | `false` | Additionally strips client telemetry headers (`x-stainless-*`, `x-app`, `x-title`, `http-referer`) and removes provider identity fields (`user`, `metadata`, `prompt_cache_key`, `safety_identifier`) from chat payloads. Credential/organization headers (`x-api-key`, `api-key`, `openai-organization`, `openai-project`) are **always** dropped — they would leak the caller's real key past per-node injection |
 
+### Budget-aware routing
+
+When upstreams return OpenAI-style ratelimit headers (`x-ratelimit-remaining-requests` / `-tokens` and `-reset-*`), the proxy tracks each node's headroom and prefers healthy nodes over low/depleted ones — first-in-cursor within a class, so an all-healthy pool rotates exactly like plain round-robin. Providers that don't send these headers keep their fair share. `/health` exposes the current headroom per node as `budget_remaining_pct` (`null` when unreported).
+
 ### Nodes (repeat contiguously from 1)
 
 | Variable | Required | Description |
