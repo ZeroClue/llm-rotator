@@ -171,8 +171,9 @@ def configure_logging(settings):
 # browsers — a browser TLS fingerprint on an API endpoint stands out more
 # than it hides. The fingerprint label is what the optional curl_cffi
 # transport (issue #47) impersonates; with the default requests transport
-# only the User-Agent half is observable.
-_PERSONA_STACKS = (
+# only the User-Agent half is observable. Public: tests and operators may
+# enumerate the stacks.
+PERSONA_STACKS = (
     {"name": "httpx-py311-linux", "user_agent": "python-httpx/0.27.0"},
     {"name": "undici-node20-linux", "user_agent": "undici/6.19.2"},
     {"name": "okhttp-android", "user_agent": "okhttp/4.12.0"},
@@ -185,13 +186,25 @@ def resolve_persona(node_id, user_agent_override=None, fingerprint_override=None
     """A node's persona attributes: explicit PERSONA_N_* overrides win;
     otherwise a stable hash of node_id picks from the curated stacks, so a
     given node presents the same persona across restarts and processes."""
-    stack = _PERSONA_STACKS[
-        hashlib.sha256(str(node_id).encode()).digest()[0] % len(_PERSONA_STACKS)
+    stack = PERSONA_STACKS[
+        hashlib.sha256(str(node_id).encode()).digest()[0] % len(PERSONA_STACKS)
     ]
     return (
         user_agent_override if user_agent_override else stack["user_agent"],
         fingerprint_override if fingerprint_override else stack["name"],
     )
+
+
+def _persona_override(node_index, kind):
+    """Read one PERSONA_N_<KIND> override: None when unset, normalized
+    (stripped) value otherwise, loud failure when set but blank."""
+    env_name = f"PERSONA_{node_index}_{kind}"
+    raw = os.getenv(env_name)
+    if raw is None:
+        return None
+    if not raw.strip():
+        raise ValueError(f"{env_name} is set but empty — remove it or give it a value")
+    return raw.strip()
 
 
 @dataclass(frozen=True)
@@ -220,14 +233,9 @@ def build_node_pool():
                 raise ValueError("Missing required node configuration")
             break
 
-        ua_raw = os.getenv(f"PERSONA_{node_index}_USER_AGENT")
-        fp_raw = os.getenv(f"PERSONA_{node_index}_FINGERPRINT")
-        for env_name, raw in ((f"PERSONA_{node_index}_USER_AGENT", ua_raw),
-                              (f"PERSONA_{node_index}_FINGERPRINT", fp_raw)):
-            if raw is not None and not raw.strip():
-                raise ValueError(f"{env_name} is set but empty — remove it or give it a value")
-
-        user_agent, fingerprint = resolve_persona(node_index, ua_raw, fp_raw)
+        user_agent = _persona_override(node_index, "USER_AGENT")
+        fingerprint = _persona_override(node_index, "FINGERPRINT")
+        user_agent, fingerprint = resolve_persona(node_index, user_agent, fingerprint)
         pool.append(Node(
             node_id=node_index,
             proxy=proxy_url,

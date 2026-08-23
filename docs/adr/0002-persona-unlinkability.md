@@ -15,15 +15,19 @@ never mixed across nodes.
 Adversary: the LLM provider's anti-abuse systems, with full server-side view
 (key, IP, TLS fingerprint, headers, body, timing). Goal: the N personas are
 mutually unlinkable and none is identifiable as "one automation stack".
-Explicit non-goals (unachievable at this layer):
 
-- **Payment identity** — keys are billed accounts; KYC links them to a real
-  identity regardless of what this proxy sends.
-- **Content/stylometric correlation** — prompts must reach the model; repo
-  names and writing style survive any header hygiene.
-- **Canonicalized-body hashing** — serialization jitter raises the bar but a
-  provider hashing parsed payloads defeats it.
-- **Host-clock timing** — all personas share one machine's clock and cadence.
+## Residual risks (accepted)
+
+| Risk | Why unfixable here | Mitigation we do provide |
+|---|---|---|
+| Payment identity | Keys are billed accounts; KYC ties them to a real identity | Documented; ops choice to source keys accordingly |
+| Content/stylometric correlation | Prompts must reach the model; repo names and writing style survive any scrubbing | `PERSONA_HYGIENE` strips identifier fields (#49); PII vault-scrubbing is a follow-up |
+| Canonicalized-body hashing | Serialization jitter raises the bar; hashing parsed payloads defeats it | Per-attempt serialization jitter lands with #46 |
+| Host-clock timing | All personas share one machine's clock and cadence | None at this layer |
+
+Fingerprint *values* are validated only for blankness in this ticket;
+semantic validation (known stack or well-formed JA3) belongs to #47, which
+consumes them.
 
 ## Decisions
 

@@ -2,6 +2,8 @@
 loud failure on malformed overrides, per-node consistency under failover,
 and health exposure. All through public interfaces; no HTTP."""
 
+import os
+
 import pytest
 
 import failover
@@ -20,7 +22,7 @@ POOL_ENV = {
 def pool_env(monkeypatch):
     for k, v in POOL_ENV.items():
         monkeypatch.setenv(k, v)
-    for k in list(__import__("os").environ):
+    for k in list(os.environ):
         if k.startswith("PERSONA_"):
             monkeypatch.delenv(k)
 
@@ -32,7 +34,7 @@ def test_persona_derivation_is_deterministic(rotator, pool_env):
     assert [(n.node_id, n.user_agent, n.fingerprint) for n in first] == \
            [(n.node_id, n.user_agent, n.fingerprint) for n in second]
     # Derived values come from the curated stacks, never empty.
-    stack_names = {s["name"] for s in rotator._PERSONA_STACKS}
+    stack_names = {s["name"] for s in rotator.PERSONA_STACKS}
     for node in first:
         assert node.user_agent
         assert node.fingerprint in stack_names
@@ -40,7 +42,7 @@ def test_persona_derivation_is_deterministic(rotator, pool_env):
 
 def test_persona_assignment_spreads_across_stacks(rotator):
     seen = {rotator.resolve_persona(node_id)[1]
-            for node_id in range(1, 4 * len(rotator._PERSONA_STACKS) + 1)}
+            for node_id in range(1, 4 * len(rotator.PERSONA_STACKS) + 1)}
     assert len(seen) >= 2  # hash assignment is not degenerate
 
 
