@@ -542,9 +542,10 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
         persona_hygiene=cfg.persona_hygiene,
         anonymity_failover=cfg.anonymity_failover,
         failover_max_wait=cfg.failover_max_wait,
-        max_waiters=cfg.failover_max_waiters,
+        failover_max_waiters=cfg.failover_max_waiters,
         redistribution_jitter=cfg.redistribution_jitter,
     )
+
 
     token_optimizer = TokenOptimizer(
         config=opt, model_name=cfg.default_model, persona_hygiene=cfg.persona_hygiene

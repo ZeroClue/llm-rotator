@@ -93,14 +93,16 @@ def compute_backoff(attempt, retry_after=None, rng=random.uniform, *,
 
 
 # Deterministic serialization variants cycled per attempt: semantically
-# identical JSON, byte-different wire form. Breaks naive body-hash linking
-# when a request is replayed across personas; a provider hashing canonical
-# JSON defeats this (accepted residual risk, ADR 0002).
+# identical JSON, byte-different wire form. The four forms stay pairwise
+# distinct for any realistic payload (compact/spaced/indented/tab-indented ×
+# key order), so consecutive attempts never carry identical bytes for a
+# provider to hash-link. A provider hashing canonical JSON defeats this
+# entirely (accepted residual risk, ADR 0002).
 _SERIALIZE_VARIANTS = (
     {"sort_keys": True, "separators": (",", ":")},
     {"sort_keys": False, "separators": (", ", ": ")},
-    {"sort_keys": True, "separators": (", ", ": ")},
-    {"sort_keys": False, "separators": (",", ": ")},
+    {"sort_keys": True, "indent": 2},
+    {"sort_keys": False, "indent": "\t"},
 )
 
 
@@ -162,7 +164,7 @@ class FailoverTransport:
                  rng=random.uniform, max_retries=4, timeout=25.0,
                  backoff_base=0.5, backoff_max=8.0, retry_posts=True,
                  persona_hygiene=False, anonymity_failover="cross",
-                 failover_max_wait=8.0, max_waiters=4,
+                 failover_max_wait=8.0, failover_max_waiters=4,
                  wait_gate=None, redistribution_jitter=True):
         self.selector = selector
         self.ledger = ledger
@@ -182,7 +184,7 @@ class FailoverTransport:
         # Bounds threads concurrently parked in same-persona waits so a burst
         # of 429s cannot pin the whole gthread pool (issue #46).
         self.wait_gate = wait_gate if wait_gate is not None \
-            else threading.Semaphore(max_waiters)
+            else threading.Semaphore(failover_max_waiters)
         self.redistribution_jitter = redistribution_jitter
         if session is not None:
             self.session = session
@@ -337,11 +339,17 @@ class FailoverTransport:
                                 finally:
                                     self.wait_gate.release()
                             else:
+                                # Gate full: this rotation IS the request's
+                                # cross-persona hop — consume the budget so a
+                                # later above-threshold 429 cannot replay again.
+                                redistributed = True
                                 logger.warning(
                                     f"429 on Node {node.node_id}: waiter cap hit, "
-                                    "skipping same-persona wait",
+                                    "rotating to another persona without waiting",
                                     extra={**log_extras,
-                                           "event": "failover_waiter_cap_hit"},
+                                           "event": "failover_redistribute",
+                                           "node_id": node.node_id,
+                                           "reason": "waiter_cap"},
                                 )
                         elif not redistributed:
                             redistributed = True
@@ -350,7 +358,8 @@ class FailoverTransport:
                                 "via another persona (Retry-After too long to wait)",
                                 extra={**log_extras,
                                        "event": "failover_redistribute",
-                                       "node_id": node.node_id},
+                                       "node_id": node.node_id,
+                                       "reason": "retry_after_too_long"},
                             )
                 else:
                     self.ledger.record_success(node)
