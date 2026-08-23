@@ -242,11 +242,10 @@ and surface — eventually manage — the env-derived configuration safely.
 *Rationale:* the observability data exists (item 9) but is scrape-only;
 operating multi-node pools today means curl + grep. Maintainer wants a proper
 dashboard before any 1.0 claim (2026-08-22).
-*Note:* deliberately un-specced — grill and/or wayfinder before building.
-Spans UI plus likely a read-back config API, so expect decomposition into a
-map with child tickets rather than one item. Charting is done: work the map
-at [issue #39](https://github.com/ZeroClue/llm-rotator/issues/39) (research
-branch: `research/live-refresh-patterns`; next up: visual prototype #43).
+*Note:* specced 2026-08-23 — wayfinder map [#39](https://github.com/ZeroClue/llm-rotator/issues/39)
+resolved into [docs/dashboard-spec.md](docs/dashboard-spec.md) (layout verdict:
+variant A status board; backend contract in #41's resolution comment). Build
+decomposition proposed in spec §9; next step is opening the build tickets.
 
 ---
 
