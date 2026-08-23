@@ -13,6 +13,7 @@ import http.cookiejar
 import json
 import logging
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -113,6 +114,47 @@ def serialize_attempt(canonical, attempt):
     ).encode("utf-8")
 
 
+# ── Quota-header parsing (issue #48) ─────────────────────────────────────────
+_DURATION_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?$")
+
+
+def parse_duration_seconds(raw):
+    """OpenAI x-ratelimit-reset-* durations: '1s', '6m', '1h2m30s'."""
+    if not raw:
+        return None
+    match = _DURATION_RE.match(raw.strip())
+    if not match or not any(match.groups()):
+        return None
+    hours, minutes, seconds = match.groups()
+    return int(hours or 0) * 3600 + int(minutes or 0) * 60 + float(seconds or 0)
+
+
+def parse_quota_headers(headers):
+    """Headroom from OpenAI-style ratelimit headers: min of the available
+    dimensions (requests/tokens) as a 0-100 percentage, plus the longest
+    reset window. Anything missing/unparseable simply narrows the picture;
+    no headers at all -> None (provider unknown to us)."""
+    remaining_pct = []
+    reset_seconds = None
+    for dim in ("requests", "tokens"):
+        limit = headers.get(f"x-ratelimit-limit-{dim}")
+        remaining = headers.get(f"x-ratelimit-remaining-{dim}")
+        if limit and remaining:
+            try:
+                limit_v, remaining_v = float(limit), float(remaining)
+            except ValueError:
+                continue
+            if limit_v > 0:
+                remaining_pct.append(max(0.0, 100.0 * remaining_v / limit_v))
+        reset = parse_duration_seconds(headers.get(f"x-ratelimit-reset-{dim}"))
+        if reset is not None:
+            reset_seconds = reset if reset_seconds is None else max(reset_seconds, reset)
+    if not remaining_pct:
+        return None
+    return {"remaining_pct": min(remaining_pct),
+            "reset_seconds": reset_seconds}
+
+
 @dataclass
 class SendResult:
     """One successful upstream response.
@@ -165,12 +207,16 @@ class FailoverTransport:
                  backoff_base=0.5, backoff_max=8.0, retry_posts=True,
                  persona_hygiene=False, anonymity_failover="cross",
                  failover_max_wait=8.0, failover_max_waiters=4,
-                 wait_gate=None, redistribution_jitter=True):
+                 wait_gate=None, redistribution_jitter=True,
+                 clock=time.monotonic):
         self.selector = selector
         self.ledger = ledger
         # PERSONA_HYGIENE: also strip client telemetry headers (x-stainless-*,
         # x-app, x-title, http-referer) outbound; see drop_outbound_header.
         self.persona_hygiene = persona_hygiene
+        # Clock seam for quota timestamps (issue #48): ledger windows are set
+        # against this clock so tests can drive them deterministically.
+        self.clock = clock
         # "cross" = today's availability-first failover (replays bytes across
         # personas). "same" = 429s with a short Retry-After wait out on the
         # SAME persona (what a legitimate single customer does); only then is
@@ -363,6 +409,9 @@ class FailoverTransport:
                             )
                 else:
                     self.ledger.record_success(node)
+                    quota = parse_quota_headers(response.headers)
+                    if quota:
+                        self.ledger.record_quota(node, now=self.clock(), **quota)
                     return SendResult(
                         status_code=response.status_code,
                         header_pairs=[

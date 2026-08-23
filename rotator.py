@@ -367,9 +367,17 @@ class HealthLedger:
     usability queries. Nodes carry no failure state themselves.
     """
 
-    def __init__(self, nodes, cooldown_base, cooldown_max, lock=None):
+    # Headroom opinions from providers that omit reset headers live this
+    # long before being treated as refilled (issue #48).
+    BUDGET_DEFAULT_TTL = 60.0
+
+    def __init__(self, nodes, cooldown_base, cooldown_max, lock=None,
+                 budget_low_pct=25.0):
         self._cooldown_base = cooldown_base
         self._cooldown_max = cooldown_max
+        # Below this remaining-percentage a node counts as "low" headroom for
+        # budget-aware routing (issue #48); 0 or less is "depleted".
+        self._budget_low_pct = budget_low_pct
         # Reentrant because NodeSelector.select() holds this same shared lock
         # while calling usable(); separate locks would break that atomicity.
         self._lock = lock if lock is not None else threading.RLock()
@@ -382,6 +390,9 @@ class HealthLedger:
                 # tear them apart. reset_all() deliberately preserves these.
                 "total_successes": 0,
                 "total_failures": 0,
+                # Quota headroom from upstream ratelimit headers; None until
+                # the provider reports it (issue #48).
+                "budget": None,
             }
             for n in nodes
         }
@@ -447,11 +458,56 @@ class HealthLedger:
             )
             entry["fail_until"] = now + cooldown
 
+    def record_quota(self, node, remaining_pct, reset_seconds=None, now=None):
+        """Store upstream-reported headroom (issue #48). reset_seconds starts
+        the window after which the budget is considered refilled; providers
+        that omit reset headers get a short default TTL so a stale headroom
+        opinion can never outlive the traffic that produced it."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            self._entry(node)["budget"] = {
+                "pct": max(0.0, min(100.0, float(remaining_pct))),
+                "reset_at": now + (self.BUDGET_DEFAULT_TTL if reset_seconds is None
+                                   else reset_seconds),
+            }
+
+    def _live_budget(self, node, now):
+        """The node's budget entry unless its reset window has elapsed
+        (expired = refilled = no opinion), for callers holding the lock."""
+        budget = self._entry(node)["budget"]
+        if budget is None:
+            return None
+        if budget["reset_at"] is not None and budget["reset_at"] <= now:
+            return None
+        return budget
+
+    def budget_class(self, node, now=None):
+        """"healthy" / "low" / "depleted" headroom class, or None when the
+        provider has not reported a quota (or the window expired)."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            budget = self._live_budget(node, now)
+        if budget is None:
+            return None
+        if budget["pct"] <= 0.0:
+            return "depleted"
+        return "low" if budget["pct"] < self._budget_low_pct else "healthy"
+
+    def budget_remaining_pct(self, node, now=None):
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            budget = self._live_budget(node, now)
+        return None if budget is None else budget["pct"]
+
     def reset_all(self):
         with self._lock:
             for entry in self._state.values():
                 entry["consecutive_failures"] = 0
                 entry["fail_until"] = 0.0
+                entry["budget"] = None
 
 
 class NodeSelector:
@@ -460,6 +516,11 @@ class NodeSelector:
     advances the cursor past each selection; if every node is cooling down,
     serves the cursor node anyway so requests never starve.
     """
+
+    # Selection preference by headroom class (issue #48): healthy beats low
+    # beats depleted; None (no quota reported) rides with "low" so unknown
+    # providers keep their fair share without outranking known-good nodes.
+    _BUDGET_RANK = {"healthy": 0, "low": 1, "depleted": 2, None: 1}
 
     def __init__(self, nodes, ledger, lock=None):
         self.nodes = list(nodes)
@@ -473,17 +534,30 @@ class NodeSelector:
             return self._index
 
     def select(self, now=None):
-        """Atomically pick the next usable node and advance the cursor."""
+        """Atomically pick the next usable node and advance the cursor.
+
+        Budget-aware (issue #48): among usable nodes, the first — in cursor
+        order — belonging to the best headroom class present wins. With an
+        all-healthy or quota-less pool this is exactly the historical
+        first-usable scan; a scan that reaches a healthy node can stop
+        immediately because nothing outranks it."""
         if now is None:
             now = time.monotonic()
         with self._lock:
             n = len(self.nodes)
             chosen = None
+            best_rank = None
             for offset in range(n):
                 i = (self._index + offset) % n
-                if self.ledger.usable(self.nodes[i], now):
+                if not self.ledger.usable(self.nodes[i], now):
+                    continue
+                rank = self._BUDGET_RANK.get(
+                    self.ledger.budget_class(self.nodes[i], now), 1)
+                if best_rank is None or rank < best_rank:
+                    best_rank = rank
                     chosen = i
-                    break
+                if best_rank == 0:
+                    break  # healthy: nothing in the pool outranks it
             if chosen is None:
                 chosen = self._index % n
             node = self.nodes[chosen]
@@ -503,6 +577,7 @@ def node_health_snapshot(nodes, ledger, now=None):
         "cooldown_seconds": state[n.node_id]["cooldown_seconds"],
         "total_successes": state[n.node_id]["total_successes"],
         "total_failures": state[n.node_id]["total_failures"],
+        "budget_remaining_pct": ledger.budget_remaining_pct(n, now=now),
     } for n in nodes]
 
 
