@@ -48,15 +48,22 @@ def client(rotator):
 
 def build_optimizer(rotator, **overrides):
     """Fresh TokenOptimizer from OPTIMIZATION_CONFIG with field overrides —
-    the single builder both the fixture and pipeline tests share."""
+    the single builder both the fixture and pipeline tests share.
+    persona_hygiene is a TokenOptimizer constructor knob (not an
+    OptimizationConfig field), so it is routed accordingly."""
     import dataclasses
 
+    persona_hygiene = overrides.pop("persona_hygiene", False)
     cfg = (
         dataclasses.replace(rotator.OPTIMIZATION_CONFIG, **overrides)
         if overrides
         else rotator.OPTIMIZATION_CONFIG
     )
-    return rotator.TokenOptimizer(config=cfg, model_name=rotator.settings.default_model)
+    return rotator.TokenOptimizer(
+        config=cfg,
+        model_name=rotator.settings.default_model,
+        persona_hygiene=persona_hygiene,
+    )
 
 
 @pytest.fixture()

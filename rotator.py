@@ -464,10 +464,12 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
         backoff_base=cfg.retry_backoff_base,
         backoff_max=cfg.retry_backoff_max,
         retry_posts=cfg.retry_posts,
-        hygiene=cfg.persona_hygiene,
+        persona_hygiene=cfg.persona_hygiene,
     )
 
-    token_optimizer = TokenOptimizer(config=opt, model_name=cfg.default_model)
+    token_optimizer = TokenOptimizer(
+        config=opt, model_name=cfg.default_model, persona_hygiene=cfg.persona_hygiene
+    )
 
     # Shutdown draining: armed by the signal handlers installed below; the
     # streamed view consults it between chunks (see guarded_stream).
@@ -549,11 +551,6 @@ class OptimizationConfig:
     enable_recursive_summarization: bool = False
     compression_threshold: float = 0.85
     summarization_model: str = "gpt-4o-mini"
-    # Persona hygiene payload stage: strip provider identity fields (user/
-    # metadata/prompt_cache_key/safety_identifier) from chat payloads before
-    # they are forwarded. Header-side hygiene lives on FailoverTransport
-    # (same PERSONA_HYGIENE flag, parsed once in Settings).
-    persona_hygiene: bool = False
 
     @classmethod
     def from_env(cls) -> "OptimizationConfig":
@@ -585,7 +582,6 @@ class OptimizationConfig:
             ("enable_recursive_summarization", "ENABLE_RECURSIVE_SUMMARIZATION", _env_bool),
             ("compression_threshold", "COMPRESSION_THRESHOLD", float),
             ("summarization_model", "SUMMARIZATION_MODEL", str),
-            ("persona_hygiene", "PERSONA_HYGIENE", _env_bool),
         ]:
             raw = os.getenv(env_name)
             if raw is not None:
@@ -633,10 +629,16 @@ class TokenOptimizer:
     - Provider-specific token calculations
     """
 
-    def __init__(self, config=None, model_name="gpt-4o"):
+    def __init__(self, config=None, model_name="gpt-4o", persona_hygiene=False):
         self.config = config if config is not None else OptimizationConfig()
         self.model_name = model_name
         self.summarization_model = self.config.summarization_model
+        # PERSONA_HYGIENE payload stage: strip provider identity fields
+        # (user/metadata/prompt_cache_key/safety_identifier) from chat
+        # payloads. Injected from Settings here rather than living on
+        # OptimizationConfig so the flag is parsed from the environment in
+        # exactly one place and header/payload hygiene can never diverge.
+        self.persona_hygiene = persona_hygiene
         
         # Initialize tiktoken encoder
         if TIKTOKEN_AVAILABLE:
@@ -751,7 +753,7 @@ class TokenOptimizer:
         prompt_cache_key, metadata.user_id). Copy-on-write like every stage;
         when disabled or nothing matches, the input object comes back
         untouched."""
-        if not self.config.persona_hygiene:
+        if not self.persona_hygiene:
             return payload
         present = _IDENTITY_PAYLOAD_FIELDS.intersection(payload)
         if not present:
@@ -759,7 +761,8 @@ class TokenOptimizer:
         logger.info(
             "Stripped identity fields from chat payload: "
             + ", ".join(sorted(present)),
-            extra={"event": "payload_hygiene", "fields": sorted(present)},
+            extra={"event": "payload_hygiene", "count": len(present),
+                   "fields": sorted(present)},
         )
         return {k: v for k, v in payload.items() if k not in _IDENTITY_PAYLOAD_FIELDS}
 

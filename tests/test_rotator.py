@@ -77,6 +77,27 @@ def test_credential_and_org_headers_never_reach_upstream(client, chat_captures):
         assert leaked not in sent
 
 
+def test_persona_hygiene_strips_payload_fields_end_to_end(client, chat_captures, make_optimizer):
+    make_optimizer(persona_hygiene=True)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o",
+            "messages": BASIC_MESSAGES,
+            "user": "end-user-123",
+            "metadata": {"user_id": "abc"},
+            "prompt_cache_key": "cache-key",
+            "safety_identifier": "safety-1",
+        },
+    )
+    assert resp.status_code == 200
+
+    sent = jload(chat_captures()[-1]["body"])
+    stripped = {"user", "metadata", "prompt_cache_key", "safety_identifier"}
+    assert not stripped & set(sent)
+    assert sent["messages"] == BASIC_MESSAGES  # messages untouched
+
+
 def test_explicit_prompt_caching_adds_valid_markers(client, chat_captures, make_optimizer):
     make_optimizer(enable_prompt_caching=True)
     resp = client.post("/v1/chat/completions", json={"model": "gpt-4o", "messages": BASIC_MESSAGES})

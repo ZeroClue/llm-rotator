@@ -140,12 +140,12 @@ class FailoverTransport:
     def __init__(self, selector, ledger, session=None, sleep=time.sleep,
                  rng=random.uniform, max_retries=4, timeout=25.0,
                  backoff_base=0.5, backoff_max=8.0, retry_posts=True,
-                 hygiene=False):
+                 persona_hygiene=False):
         self.selector = selector
         self.ledger = ledger
         # PERSONA_HYGIENE: also strip client telemetry headers (x-stainless-*,
         # x-app, x-title, http-referer) outbound; see drop_outbound_header.
-        self.hygiene = hygiene
+        self.persona_hygiene = persona_hygiene
         if session is not None:
             self.session = session
         else:
@@ -176,12 +176,20 @@ class FailoverTransport:
             node = self.selector.select()
             attempts += 1
 
-            request_headers = {
-                k: v for k, v in headers.items()
-                if not drop_outbound_header(k, hygiene=self.hygiene)
-            }
+            dropped = [k for k in headers
+                       if drop_outbound_header(k, hygiene=self.persona_hygiene)]
+            request_headers = {k: v for k, v in headers.items() if k not in dropped}
             request_headers["Authorization"] = f"Bearer {node.api_key}"
             proxies = {"http": node.proxy, "https": node.proxy}
+
+            if dropped:
+                # Counts only — never header names or values: client telemetry
+                # must not be echoed into the proxy's own logs either.
+                logger.info(
+                    f"Dropped {len(dropped)} outbound client header(s)",
+                    extra={**log_extras, "event": "header_hygiene",
+                           "count": len(dropped)},
+                )
 
             logger.info(
                 f"Attempt {attempt + 1}/{self.max_retries}: Routing via Node {node.node_id} "

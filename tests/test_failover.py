@@ -74,7 +74,7 @@ def stub_rng(lo, hi):
 
 def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
                    backoff_base=0.5, backoff_max=8.0, use_real_session=False,
-                   retry_posts=True, hygiene=False):
+                   retry_posts=True, persona_hygiene=False):
     nodes = [
         rotator.Node(node_id=i, proxy=f"socks5h://node{i}.ts.net:1080", api_key=f"key{i}")
         for i in range(1, count + 1)
@@ -93,7 +93,7 @@ def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
         backoff_base=backoff_base,
         backoff_max=backoff_max,
         retry_posts=retry_posts,
-        hygiene=hygiene,
+        persona_hygiene=persona_hygiene,
     )
     return transport, ledger, sleeper, nodes, session or transport.session
 
@@ -296,12 +296,12 @@ def test_credential_and_org_headers_never_reach_upstream(rotator):
         assert leaked not in sent
 
 
-@pytest.mark.parametrize("hygiene", [True, False])
-def test_persona_hygiene_telemetry_headers(rotator, hygiene):
+@pytest.mark.parametrize("persona_hygiene", [True, False])
+def test_persona_hygiene_telemetry_headers(rotator, persona_hygiene):
     """PERSONA_HYGIENE extends the drop set with client telemetry that
     fingerprints the automation stack; unrelated headers always pass."""
     rok = FakeResponse(status=200, content=b"ok")
-    t, *_ , session = make_transport(rotator, [rok], hygiene=hygiene)
+    t, *_ , session = make_transport(rotator, [rok], persona_hygiene=persona_hygiene)
 
     t.send("POST", "http://up.test/v1", headers={
         "X-Stainless-Lang": "python",
@@ -316,7 +316,7 @@ def test_persona_hygiene_telemetry_headers(rotator, hygiene):
     assert "keep-me" in sent  # unrelated header passes either way
     telemetry = {"x-stainless-lang", "x-stainless-runtime",
                  "x-app", "x-title", "http-referer"}
-    if hygiene:
+    if persona_hygiene:
         assert not sent & telemetry
     else:
         assert telemetry <= sent
