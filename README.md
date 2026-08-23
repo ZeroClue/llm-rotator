@@ -147,6 +147,7 @@ index and silently drops later nodes.
 | `FAILOVER_MAX_WAIT` | `8.0` | Longest 429 `Retry-After` (seconds) the same-persona ladder will wait out; longer values redistribute instead |
 | `FAILOVER_MAX_WAITERS` | `4` | Cap on threads concurrently parked in same-persona waits |
 | `REDISTRIBUTION_JITTER` | `true` | Re-serialize JSON bodies per attempt with varied framing (semantically identical, byte-different) so no two attempts carry identical bytes |
+| `TRANSPORT` | `requests` | `curl_cffi` switches outbound to the libcurl-based adapter (optional dependency: `pip install curl_cffi`; startup fails loudly without it), giving each persona a pinned TLS/HTTP2 fingerprint. Fingerprint labels: `PERSONA_N_FINGERPRINT` accepts `ja3:<spec>`, `akamai:<spec>`, or a curl_cffi impersonate target; under `requests`, only the persona User-Agent half is observable |
 | `STREAM_DRAIN_WINDOW` | `20.0` | Graceful-shutdown drain window (seconds from SIGTERM) for in-flight SSE streams: they finish naturally inside it, otherwise they end with a terminal `proxy_shutdown` error event + `[DONE]`. Keep it below **every** outer killer — `GUNICORN_GRACEFUL_TIMEOUT` *and* your container manager's stop grace (`stop_grace_period`, `docker stop -t`, systemd `TimeoutStopSec`); `0` cuts on the next chunk |
 | `DEFAULT_MODEL` | `gpt-4o` | Model used for token counting |
 | `LOG_LEVEL` | `INFO` | Logging level |
