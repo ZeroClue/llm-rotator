@@ -18,9 +18,12 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pytest
+          # Optional transport dep (#47): installed in CI so the adapter's
+          # live tests actually execute instead of skipping everywhere.
+          pip install curl_cffi
 
       - name: Bytecode compile check
-        run: python3 -m py_compile rotator.py
+        run: python3 -m py_compile rotator.py failover.py
 
       - name: Test suite
         run: python3 -m pytest tests/ -v

@@ -132,26 +132,31 @@ def test_adapter_streams_incrementally_and_never_stores_cookies(mock):
                     b'{"error": "unused"}')]
 
     adapter = failover.CurlCffiSessionAdapter("chrome124")
+    # Exchange #1 (POST consumes the scripted Set-Cookie response).
     response = adapter.request(
-        "GET", mock.url("/v1/models"), headers={}, data=None,
+        "POST", mock.url("/v1/chat/completions"),
+        headers={"Content-Type": "application/json"},
+        data=b'{"model":"gpt-4o","messages":[]}',
         proxies=None, timeout=10.0, stream=False)
 
     # Cookie refusal: the Set-Cookie from this exchange must not survive.
     assert not list(getattr(adapter._session.cookies, "values", lambda: [])())
 
-    # Streaming parity: TTFB well before completion.
+    # Streaming parity: TTFB well before completion, and delivery is
+    # incremental (per network read — per SSE event through the mock).
     stream_resp = adapter.request(
         "POST", mock.url("/v1/chat/completions"),
         headers={"Content-Type": "application/json"},
         data=b'{"model":"gpt-4o","stream":true,"messages":[]}',
         proxies=None, timeout=10.0, stream=True)
     ttfb = None
-    chunks = []
+    arrivals = []
     start = time.monotonic()
     for chunk in stream_resp.iter_content(chunk_size=1):
+        now = time.monotonic() - start
         if ttfb is None:
-            ttfb = time.monotonic() - start
-        chunks.append(chunk)
+            ttfb = now
+        arrivals.append((now, len(chunk)))
     total = time.monotonic() - start
-    assert ttfb is not None and len(chunks) > 10  # byte-level reads happened
+    assert ttfb is not None and len(arrivals) >= 4  # per-event granularity
     assert ttfb < total * 0.6  # first bytes arrived well before the tail
