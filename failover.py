@@ -212,8 +212,12 @@ class _CurlCffiResponse:
         return self._response.content
 
     def iter_content(self, chunk_size):
+        # chunk_size is deliberately NOT forwarded: curl_cffi cannot honor it
+        # (warns and buffers), while its native iteration yields network-read
+        # granularity — per-SSE-event, which beats requests' byte-at-a-time
+        # reads for streaming latency anyway.
         try:
-            for chunk in self._response.iter_content(chunk_size=chunk_size):
+            for chunk in self._response.iter_content():
                 yield chunk
         finally:
             self.close()
