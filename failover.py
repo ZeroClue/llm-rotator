@@ -389,6 +389,15 @@ class FailoverTransport:
         self._sessions = {}
         self._sessions_lock = threading.Lock()
 
+    def _record_attempt(self, log, node, reason, status, started):
+        """One attempt-log row (spec §4.2); durations ride the clock seam."""
+        log.append({
+            "node_id": node.node_id,
+            "status": status,
+            "reason": reason,
+            "duration_ms": round((self.clock() - started) * 1000, 1),
+        })
+
     def _session_for(self, node):
         """The session for one attempt: the shared default unless a
         session_factory was provided, in which case one lazily-built session
@@ -576,12 +585,8 @@ class FailoverTransport:
                     quota = parse_quota_headers(response.headers)
                     if quota:
                         self.ledger.record_quota(node, now=self.clock(), **quota)
-                    attempt_log.append({
-                        "node_id": node.node_id, "status": status_code,
-                        "reason": reason,
-                        "duration_ms": round(
-                            (self.clock() - attempt_started) * 1000, 1),
-                    })
+                    self._record_attempt(attempt_log, node, reason,
+                                         status_code, attempt_started)
                     return SendResult(
                         status_code=response.status_code,
                         header_pairs=[
@@ -595,12 +600,8 @@ class FailoverTransport:
                     )
 
             if failed:
-                attempt_log.append({
-                    "node_id": node.node_id, "status": status_code,
-                    "reason": reason,
-                    "duration_ms": round(
-                        (self.clock() - attempt_started) * 1000, 1),
-                })
+                self._record_attempt(attempt_log, node, reason,
+                                     status_code, attempt_started)
 
             if single_shot_post and failed:
                 return AllNodesFailed(last_error=last_error,
