@@ -7,7 +7,7 @@ The app is built lazily and exactly once from the environment: importing `rotato
 ## Current understanding
 
 - Module/app lifecycle is lazy and single-build: bare import is side-effect-free; global state exists only after `get_app()`/`create_app()` runs — see `lessons/2026-08-24-views-get-state-by-injection-not-import.md`
-- Views and dashboard modules take injected context providers instead of importing rotator; mandatory because script execution makes the live app `__main__`, so a by-name import yields a second, empty copy.
+- Views and dashboard modules take injected context providers instead of importing rotator, for a verified runtime reason — same lesson as above.
 
 ## Open questions
 
