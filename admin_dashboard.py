@@ -83,8 +83,10 @@ def register_admin_dashboard(application, *, context_provider):
 
     @bp.route("/admin/fragments/requests")
     def admin_requests_fragment():
-        return render_template("admin_requests.html", **context_provider(),
-                               relative_ts=_relative_ts)
+        context = context_provider()
+        requests = context.pop("telemetry").ring_snapshot()
+        return render_template("admin_requests.html", requests=requests,
+                               relative_ts=_relative_ts, **context)
 
     application.register_blueprint(bp)
     logger.info("Admin dashboard registered at /admin (read-only, "

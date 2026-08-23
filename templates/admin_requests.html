@@ -24,7 +24,10 @@
       <td>{% if r.tokens %}{{ r.tokens.total }}{% else %}<span class="dim">—</span>{% endif %}</td>
       <td>
         {% if r.attempts %}
-        <details class="attempts">
+        {# hx-preserve keeps an open attempt view across the 5s poll swap;
+           id is stable per request. #}
+        <details class="attempts" id="att-{{ r.request_id[:8] }}"
+                 hx-preserve>
           <summary>{{ r.attempts | length }} attempt{{ "s" if r.attempts | length > 1 }}</summary>
           <table class="attempt-detail">
             <tr><th>node</th><th>status</th><th>reason</th><th>ms</th></tr>

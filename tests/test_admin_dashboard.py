@@ -132,6 +132,8 @@ def test_requests_fragment_renders_ring_newest_first(client, rotator,
     assert "42ms" in html
     assert ">10<" in html                          # token total
     assert "2 attempts" in html or "1 attempt" in html
+    # Newest first: entry 1 ('a'*32 + '1') renders before entry 0.
+    assert html.index("a" * 8 + "1") < html.index("a" * 8 + "0")
 
 
 def test_requests_fragment_marks_failures_and_shows_attempts(client, rotator,
