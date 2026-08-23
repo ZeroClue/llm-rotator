@@ -25,8 +25,9 @@ class Telemetry:
     """Request ring + per-node reason buckets + lifetime counters."""
 
     def __init__(self, *, ring_maxlen=200, window_minutes=60,
-                 clock=time.monotonic):
+                 clock=time.monotonic, wall_clock=time.time):
         self._clock = clock
+        self._wall_clock = wall_clock
         self._window_minutes = window_minutes
         self._ring = deque(maxlen=ring_maxlen)
         # node_id -> {minute: Counter({reason: n}), "tokens": int}
@@ -47,6 +48,9 @@ class Telemetry:
         ends (update-in-place, spec §4.3)."""
         entry = {
             "ts": self._clock(),
+            # Wall-clock twin for UI display ("absolute on hover") — the
+            # monotonic ts orders the ring but can't render a date.
+            "wall_ts": self._wall_clock(),
             "request_id": request_id,
             "method": method,
             "path": path,

@@ -20,8 +20,7 @@
   </section>
 
   <section id="requests-section">
-    <h2>Recent requests</h2>
-    <p class="dim">Lands with dashboard T3 (#63).</p>
+    {% include "admin_requests.html" %}
   </section>
 
   <section id="config-section">
@@ -32,5 +31,12 @@
 <footer>
   uptime {{ "%.0f"|format(uptime_seconds) }}s · read-only · loopback-trust
 </footer>
+<script>
+  // Click-to-copy full request ids (zero-build: one inline handler).
+  document.addEventListener("click", function(e) {
+    var el = e.target.closest(".rid");
+    if (el && el.dataset.rid) navigator.clipboard.writeText(el.dataset.rid);
+  });
+</script>
 </body>
 </html>

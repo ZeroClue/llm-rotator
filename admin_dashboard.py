@@ -48,6 +48,13 @@ def _spark_height(slot):
     return min(100, slot["fail"] * 25 + slot["ok"] * 12)
 
 
+def _wall_datetime(wall_ts):
+    """Absolute display for a ring entry's wall-clock timestamp."""
+    if not wall_ts:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(wall_ts))
+
+
 def register_admin_dashboard(application, *, context_provider):
     """Called from create_app(); context_provider() supplies nodes snapshot,
     cursor index, in-flight count, draining flag, settings, optimization
@@ -55,6 +62,7 @@ def register_admin_dashboard(application, *, context_provider):
     bp = Blueprint("admin_dashboard", __name__)
     bp.add_app_template_global(_mask, "mask")
     bp.add_app_template_global(_spark_height, "spark_height")
+    bp.add_app_template_global(_wall_datetime, "datetime_from")
 
     @bp.route("/admin")
     def admin_page():
@@ -72,6 +80,13 @@ def register_admin_dashboard(application, *, context_provider):
     def admin_config_fragment():
         return render_template("admin_config.html", mask=_mask,
                                **context_provider())
+
+    @bp.route("/admin/fragments/requests")
+    def admin_requests_fragment():
+        context = context_provider()
+        requests = context.pop("telemetry").ring_snapshot()
+        return render_template("admin_requests.html", requests=requests,
+                               relative_ts=_relative_ts, **context)
 
     application.register_blueprint(bp)
     logger.info("Admin dashboard registered at /admin (read-only, "

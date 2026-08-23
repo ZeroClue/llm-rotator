@@ -703,6 +703,9 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
                                    if e["cooldown_seconds"] <= 0),
             "inflight": shutdown_state.inflight if shutdown_state else 0,
             "draining": shutdown_state.draining() if shutdown_state else False,
+            # Telemetry object, not a snapshot: only the requests route pays
+            # the ring-copy cost; the 3s nodes poll must not.
+            "telemetry": telemetry,
             "settings": settings,
             "opt": OPTIMIZATION_CONFIG,
             "uptime_seconds": time.time() - APP_STARTED_AT if APP_STARTED_AT else 0,
