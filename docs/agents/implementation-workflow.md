@@ -14,7 +14,11 @@ this workflow overrides it.
    after review.
 2. **Commit and push each commit** — Clear conventional messages (`feat:`,
    `fix:`, `docs:`). Push immediately after every commit. A local-only commit
-   is silently dropped by squash merges.
+   is silently dropped by squash merges. **Adding new files?** Audit the three
+   silent manifests in the same commit — `.gitignore` (skipped by
+   `git add -A`), `.dockerignore` (excluded from the build context), and the
+   Dockerfile COPY whitelist (absent from the image). All three fail without
+   a warning; see the AGENTS.md gotcha.
 3. **PR** — Open with `gh pr create`. Every `Closes #N` must name the issue
    whose acceptance criteria this diff actually implements (read the issue
    body; roadmap numbering and issue numbers diverge). Apply `ready-for-agent`
