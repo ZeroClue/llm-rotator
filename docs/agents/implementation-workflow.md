@@ -4,11 +4,18 @@ How changes land in this repo: branch → commit → PR → review → verify �
 → close. Each step ends in a checkable **gate**; a failed gate stops the
 workflow until it passes.
 
-Applies to every change that lands on `main`, including docs-only changes.
+Applies to every change that lands on `main`, including docs-only changes — with one
+**fast lane**: commits whose changed paths are exclusively under `edukai/` (the education
+store) may land directly on `main` with no ticket, branch, PR, or pre-merge review; CI
+still runs post-hoc on pushes, and store hygiene is enforced by the heartbeat Audit checklist in
+`edukai/AGENTS.md`. Mixing any path outside `edukai/` into a commit voids the exemption
+(`.gitignore`/`.dockerignore` edits made for the store's benefit included). README,
+`docs/`, and ADRs are project-facing claims and never qualify.
 Where a generic skill default says "commit your work to the current branch",
 this workflow overrides it.
 
-1. **Branch** — One ticket per branch, never work directly on `main`:
+1. **Branch** — One ticket per branch, never work directly on `main` (sole exception:
+   the `edukai/` fast lane above):
    `git checkout -b implement-<slug>`. If working-tree changes span two
    tickets, split them onto separate branches before the first commit, not
    after review.
