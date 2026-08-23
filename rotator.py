@@ -625,6 +625,18 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
                 "TRANSPORT=curl_cffi requires the optional dependency "
                 "curl_cffi (pip install curl_cffi); refusing to silently "
                 "degrade the persona fingerprint layer") from exc
+        # Curated stack LABELS are not curl_cffi impersonate targets; under
+        # this transport they would only fail mid-request, so fail at startup
+        # instead and point operators at the ja3:/akamai:/target escape hatches.
+        label_set = {s["name"] for s in PERSONA_STACKS}
+        offenders = [n.fingerprint for n in NODE_POOL
+                     if n.fingerprint in label_set]
+        if offenders:
+            raise RuntimeError(
+                "TRANSPORT=curl_cffi: curated persona labels are not valid "
+                f"impersonation targets ({', '.join(offenders)}). Set "
+                "PERSONA_N_FINGERPRINT to a curl_cffi target or a "
+                "ja3:/akamai: spec.")
         session_factory = failover.CurlCffiSessionAdapter
     else:
         session_factory = None

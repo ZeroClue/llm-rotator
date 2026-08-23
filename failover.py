@@ -174,6 +174,25 @@ def resolve_impersonation(fingerprint):
     return {"impersonate": fingerprint}
 
 
+class _CaseInsensitiveHeaders:
+    """Case-insensitive get/items over the upstream header pairs — matches
+    requests.CaseInsensitiveDict semantics, which send()'s Retry-After
+    lookup and parse_quota_headers' lowercase lookups depend on."""
+
+    def __init__(self, pairs):
+        self._pairs = list(pairs)
+
+    def get(self, key, default=None):
+        lowered = key.lower()
+        for k, v in self._pairs:
+            if k.lower() == lowered:
+                return v
+        return default
+
+    def items(self):
+        return list(self._pairs)
+
+
 class _CurlCffiResponse:
     """The minimal requests.Response surface FailoverTransport.send()
     consumes, backed by a curl_cffi response."""
@@ -181,7 +200,7 @@ class _CurlCffiResponse:
     def __init__(self, response):
         self._response = response
         self.status_code = response.status_code
-        self._headers = dict(response.headers.items())
+        self._headers = _CaseInsensitiveHeaders(response.headers.items())
         self.closed = False
 
     @property
@@ -209,9 +228,16 @@ class CurlCffiSessionAdapter:
     """requests.Session-shaped wrapper over curl_cffi, pinned to ONE persona
     fingerprint for its lifetime (issue #47): impersonating per-request would
     churn a persona's TLS identity mid-conversation. One instance per
-    fingerprint lives on the transport; cookies are cleared after every
-    exchange because curl_cffi has no refuse-all policy hook like
-    _NoStoreCookiePolicy — same guarantee, blunter mechanism."""
+    fingerprint lives on the transport.
+
+    Cookies: per-persona sessions make cross-persona leakage structurally
+    impossible (the original threat behind _NoStoreCookiePolicy), so clearing
+    here is hygiene against unbounded jar growth, best-effort around
+    curl_cffi's lack of a refuse-all policy hook.
+
+    Exceptions are translated into the requests hierarchy so send()'s
+    failure classification (timeout/connection/general) keeps working
+    unchanged across transports."""
 
     def __init__(self, fingerprint=""):
         from curl_cffi import requests as cffi_requests
@@ -220,21 +246,36 @@ class CurlCffiSessionAdapter:
 
     def request(self, method, url, headers=None, data=None, proxies=None,
                 timeout=None, stream=False):
-        response = self._session.request(
-            method=method, url=url, headers=headers, data=data,
-            proxies=proxies, timeout=timeout, stream=stream,
-        )
+        try:
+            response = self._session.request(
+                method=method, url=url, headers=headers, data=data,
+                proxies=proxies, timeout=timeout, stream=stream,
+            )
+        except requests.Timeout:
+            raise
+        except requests.RequestException:
+            raise
+        except Exception as exc:
+            # curl_cffi raises its own hierarchy (CurlError & friends);
+            # classify by name so version drift degrades to the generic
+            # retryable bucket rather than crashing the attempt.
+            name = type(exc).__name__.lower()
+            if "timeout" in name:
+                raise requests.Timeout(str(exc)) from exc
+            if "connection" in name:
+                raise requests.ConnectionError(str(exc)) from exc
+            raise requests.RequestException(str(exc)) from exc
         try:
             self._session.cookies.clear()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("curl_cffi cookie clear failed: %s", exc)
         return _CurlCffiResponse(response)
 
     def close(self):
         try:
             self._session.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("curl_cffi session close failed: %s", exc)
 
 
 @dataclass
@@ -242,9 +283,11 @@ class SendResult:
     """One successful upstream response.
 
     body() returns bytes when sent with stream=False, or a chunk iterator
-    when stream=True; either way the underlying response is closed exactly
-    once, after the body is consumed. body() is single-shot: consuming a
-    streamed result twice re-enters an already-closed response and raises.
+    when sent with stream=True; either way the underlying response is closed
+    exactly once, after the body is consumed. body() is single-shot:
+    consuming a streamed result twice re-enters an already-closed response
+    and raises. _response is a requests.Response, or an equivalent shim
+    (see _CurlCffiResponse) when a non-requests session factory is wired.
     """
     status_code: int
     header_pairs: list

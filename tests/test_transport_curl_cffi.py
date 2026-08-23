@@ -116,3 +116,42 @@ def test_adapter_session_carries_pinned_fingerprint(fingerprint, expected_kwargs
         kwargs = session_cls.call_args[1]
         for key, value in expected_kwargs.items():
             assert kwargs[key] == value
+
+
+@pytest.mark.skipif(not CURL_CFFI_INSTALLED,
+                    reason="optional dependency curl_cffi not installed")
+def test_adapter_streams_incrementally_and_never_stores_cookies(mock):
+    """Live adapter smoke against the scriptable mock upstream: SSE chunks
+    arrive well before the body completes (TTFB parity with the requests
+    transport), and a Set-Cookie on one exchange never rides the next."""
+    import time
+
+    mock.sse_parts = 4
+    mock.chunk_delay = 0.15
+    mock.script = [(200, {"Set-Cookie": "tracker=leak; Path=/"},
+                    b'{"error": "unused"}')]
+
+    adapter = failover.CurlCffiSessionAdapter("chrome124")
+    response = adapter.request(
+        "GET", mock.url("/v1/models"), headers={}, data=None,
+        proxies=None, timeout=10.0, stream=False)
+
+    # Cookie refusal: the Set-Cookie from this exchange must not survive.
+    assert not list(getattr(adapter._session.cookies, "values", lambda: [])())
+
+    # Streaming parity: TTFB well before completion.
+    stream_resp = adapter.request(
+        "POST", mock.url("/v1/chat/completions"),
+        headers={"Content-Type": "application/json"},
+        data=b'{"model":"gpt-4o","stream":true,"messages":[]}',
+        proxies=None, timeout=10.0, stream=True)
+    ttfb = None
+    chunks = []
+    start = time.monotonic()
+    for chunk in stream_resp.iter_content(chunk_size=1):
+        if ttfb is None:
+            ttfb = time.monotonic() - start
+        chunks.append(chunk)
+    total = time.monotonic() - start
+    assert ttfb is not None and len(chunks) > 10  # byte-level reads happened
+    assert ttfb < total * 0.6  # first bytes arrived well before the tail
