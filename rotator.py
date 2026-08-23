@@ -17,6 +17,7 @@ Features:
 import os
 import re
 import hmac
+import hashlib
 import json
 import time
 import signal
@@ -166,12 +167,42 @@ def configure_logging(settings):
 # ─────────────────────────────────────────────────────────────────────────────
 # Build Node Pool from Environment Variables
 # ─────────────────────────────────────────────────────────────────────────────
+# Curated client personas: realistic API-client stacks, deliberately NOT
+# browsers — a browser TLS fingerprint on an API endpoint stands out more
+# than it hides. The fingerprint label is what the optional curl_cffi
+# transport (issue #47) impersonates; with the default requests transport
+# only the User-Agent half is observable.
+_PERSONA_STACKS = (
+    {"name": "httpx-py311-linux", "user_agent": "python-httpx/0.27.0"},
+    {"name": "undici-node20-linux", "user_agent": "undici/6.19.2"},
+    {"name": "okhttp-android", "user_agent": "okhttp/4.12.0"},
+    {"name": "reqwest-macos", "user_agent": "reqwest/0.12.5"},
+    {"name": "requests-windows", "user_agent": "python-requests/2.32.3"},
+)
+
+
+def resolve_persona(node_id, user_agent_override=None, fingerprint_override=None):
+    """A node's persona attributes: explicit PERSONA_N_* overrides win;
+    otherwise a stable hash of node_id picks from the curated stacks, so a
+    given node presents the same persona across restarts and processes."""
+    stack = _PERSONA_STACKS[
+        hashlib.sha256(str(node_id).encode()).digest()[0] % len(_PERSONA_STACKS)
+    ]
+    return (
+        user_agent_override if user_agent_override else stack["user_agent"],
+        fingerprint_override if fingerprint_override else stack["name"],
+    )
+
+
 @dataclass(frozen=True)
 class Node:
-    """One upstream target: an egress paired with the API key spent through it."""
+    """One upstream target: an egress paired with the API key spent through
+    it, presenting one consistent client persona (see docs/adr/0002)."""
     node_id: int
     proxy: str
     api_key: str = field(repr=False)
+    user_agent: str = ""
+    fingerprint: str = ""
 
 
 def build_node_pool():
@@ -189,8 +220,22 @@ def build_node_pool():
                 raise ValueError("Missing required node configuration")
             break
 
-        pool.append(Node(node_id=node_index, proxy=proxy_url, api_key=api_key))
-        logger.info(f"Loaded node {node_index}: {proxy_url}")
+        ua_raw = os.getenv(f"PERSONA_{node_index}_USER_AGENT")
+        fp_raw = os.getenv(f"PERSONA_{node_index}_FINGERPRINT")
+        for env_name, raw in ((f"PERSONA_{node_index}_USER_AGENT", ua_raw),
+                              (f"PERSONA_{node_index}_FINGERPRINT", fp_raw)):
+            if raw is not None and not raw.strip():
+                raise ValueError(f"{env_name} is set but empty — remove it or give it a value")
+
+        user_agent, fingerprint = resolve_persona(node_index, ua_raw, fp_raw)
+        pool.append(Node(
+            node_id=node_index,
+            proxy=proxy_url,
+            api_key=api_key,
+            user_agent=user_agent,
+            fingerprint=fingerprint,
+        ))
+        logger.info(f"Loaded node {node_index}: {proxy_url} (persona: {fingerprint})")
         node_index += 1
 
     logger.info(f"Node pool initialized with {len(pool)} nodes")
@@ -424,6 +469,8 @@ def node_health_snapshot(nodes, ledger, now=None):
     return [{
         "node_id": n.node_id,
         "proxy": n.proxy,
+        "user_agent": n.user_agent,
+        "fingerprint": n.fingerprint,
         "consecutive_failures": state[n.node_id]["consecutive_failures"],
         "cooldown_seconds": state[n.node_id]["cooldown_seconds"],
         "total_successes": state[n.node_id]["total_successes"],

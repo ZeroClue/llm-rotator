@@ -180,6 +180,11 @@ class FailoverTransport:
                        if drop_outbound_header(k, hygiene=self.persona_hygiene)]
             request_headers = {k: v for k, v in headers.items() if k not in dropped}
             request_headers["Authorization"] = f"Bearer {node.api_key}"
+            if node.user_agent:
+                # Persona identity: the node's own User-Agent always wins over
+                # the client's — a persona is its whole client stack, and a
+                # client UA under a persona fingerprint would be incoherent.
+                request_headers["User-Agent"] = node.user_agent
             proxies = {"http": node.proxy, "https": node.proxy}
 
             if dropped:
