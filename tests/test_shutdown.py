@@ -195,8 +195,13 @@ class TestInstallShutdownHandlers:
         spy = SignalSpy()
         clock = FakeClock(now=100.0)
         state = ShutdownState(clock=clock)
-        make_installer(spy)(state, 20.0)
+        # Bare-handler path (SIG_DFL prev) drains-and-exits: without an
+        # injected exit_fn this test used to os._exit(0) the pytest process
+        # itself, silently truncating the suite here (issue #51).
+        exits = []
+        make_installer(spy)(state, 20.0, exit_fn=lambda code: exits.append(code))
         spy.handlers[signal.SIGTERM](signal.SIGTERM, None)
+        assert exits == [0]
         clock.now = 100.5
         assert not state.draining()
         clock.now = 120.0
