@@ -1,0 +1,44 @@
+<div id="nodes" hx-get="/admin/fragments/nodes" hx-trigger="every 3s"
+     hx-swap="outerHTML">
+  <h2>Nodes</h2>
+  <div class="gauges">
+    <div class="gauge"><div class="v">{{ nodes_available }}/{{ nodes|length }}</div><div class="k">nodes available</div></div>
+    <div class="gauge"><div class="v">{{ inflight }}</div><div class="k">in-flight streams</div></div>
+    {% if draining %}<div class="gauge"><div class="v" style="color:var(--bad)">yes</div><div class="k">draining</div></div>{% endif %}
+  </div>
+
+  <table class="nodes">
+    <tr>
+      <th></th><th>persona</th><th>egress</th><th>status</th><th>cooldown</th>
+      <th>consec fails</th><th>last error</th><th>quota</th>
+      <th>ok / fail</th><th>ok %</th><th>last hour</th>
+    </tr>
+    {% for n in nodes %}
+    {% set total = n.total_successes + n.total_failures %}
+    {% set ok_pct = (100 * n.total_successes / total) | round | int if total else '—' %}
+    <tr class="{{ 'cursor' if n.is_cursor }}">
+      <td>{% if n.is_cursor %}<span class="cursor-tag">▶ next</span>{% endif %}#{{ n.node_id }}</td>
+      <td>{{ n.user_agent }}</td>
+      <td class="dim">{{ n.proxy }}</td>
+      <td>{% if n.cooldown_seconds > 0 %}<span class="pill pill-cool">cooling</span>
+              {% else %}<span class="pill pill-ok">usable</span>{% endif %}</td>
+      <td class="cooldown">{% if n.cooldown_seconds > 0 %}<b>{{ cooldown_display(n.cooldown_seconds) }}</b>
+              <span class="bar"><i style="width: {{ [100 - n.cooldown_seconds * 2, 5] | max }}%"></i></span>
+              {% else %}<span class="dim">—</span>{% endif %}</td>
+      <td>{{ n.consecutive_failures }}</td>
+      <td>{% if n.last_error %}<span class="pill pill-dep">{{ n.last_error.reason }}</span>
+              <span class="dim">{{ relative_ts(n.last_error.ts) }}</span>
+              {% else %}<span class="dim">—</span>{% endif %}</td>
+      <td>{% if n.budget_remaining_pct is none %}<span class="dim">—</span>
+              {% else %}{{ n.budget_remaining_pct }}%{% endif %}</td>
+      <td>{{ n.total_successes }} / {{ n.total_failures }}</td>
+      <td>{{ ok_pct }}{% if ok_pct != '—' %}%{% endif %}</td>
+      <td>
+        <span class="spark" title="per-minute outcomes, last hour">
+        {% for slot in n.window %}{% if slot.fail %}<i class="f"{% else %}<i class="o"{% endif %} style="height: {{ spark_height(slot) }}%"></i>{% endfor %}
+        </span>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
