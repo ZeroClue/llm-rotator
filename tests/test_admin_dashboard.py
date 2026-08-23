@@ -20,8 +20,22 @@ def test_admin_page_renders_sections(client):
     assert 'id="nodes"' in html
     assert 'id="config"' in html
     assert "/static/vendor/htmx.min.js" in html
-    assert "hx-trigger=\"every 3s\"" in html          # nodes polling
+    assert "hx-trigger=\"every 3s [!document.body.classList.contains('paused')]\"" in html  # nodes polling
     assert "<noscript>" in html                        # refresh fallback
+
+
+def test_admin_page_includes_ring_entries_not_just_fragments(client, rotator,
+                                                             fresh_telemetry):
+    """The page's first paint must carry ring data — not an empty state
+    that only fixes itself after the first 5s poll (live-caught bug)."""
+    fresh_telemetry.record_request(
+        request_id="e" * 32, method="POST", path="/v1/chat/completions",
+        node_id=2, outcome="ok", status_code=200)
+
+    html = client.get("/admin").get_data(as_text=True)
+
+    assert "No requests proxied yet." not in html
+    assert "eeeeeee" in html
 
 
 def test_nodes_fragment_renders_cursor_and_counts(client):
@@ -164,3 +178,51 @@ def test_requests_fragment_single_shot_abort_badge(client, rotator,
     html = client.get("/admin/fragments/requests").get_data(as_text=True)
 
     assert "aborted" in html
+
+
+# ── Chrome (issue #64) ───────────────────────────────────────────────────────
+
+def test_chrome_pause_toggle_and_poll_gating(client):
+    html = client.get("/admin").get_data(as_text=True)
+
+    assert 'id="pause-toggle"' in html
+    # Both polled fragments gate their trigger on the body pause class.
+    assert "every 3s [!document.body.classList.contains('paused')]" in html
+    assert "every 5s [!document.body.classList.contains('paused')]" in html
+    assert 'id="pause-toggle"' in html
+
+
+def test_chrome_staleness_self_report_present(client):
+    page = client.get("/admin").get_data(as_text=True)
+    assert "data-poll-interval" in page
+    assert "htmx:afterSwap" in page
+
+    nodes = client.get("/admin/fragments/nodes").get_data(as_text=True)
+    requests = client.get("/admin/fragments/requests").get_data(as_text=True)
+    assert 'class="updated dim"' in nodes
+    assert 'data-poll-interval="3"' in nodes
+    assert 'data-poll-interval="5"' in requests
+
+
+def test_chrome_aggregate_line_renders_telemetry_numbers(client, rotator,
+                                                         fresh_telemetry):
+    entry = fresh_telemetry.record_request(
+        request_id="d" * 32, method="POST", path="/v1/chat/completions",
+        node_id=2, outcome="ok", status_code=200)
+    fresh_telemetry.record_outcome(2, "ok")  # the view does this per attempt
+    fresh_telemetry.complete_request(entry, tokens={
+        "prompt": 9, "completion": 1, "total": 10})
+
+    html = client.get("/admin").get_data(as_text=True)
+
+    assert "1 req/h" in html
+    assert "10 tokens last hour" in html
+    assert "10 lifetime" in html
+
+
+def test_chrome_footer_shows_uptime_and_started_at(client):
+    html = client.get("/admin").get_data(as_text=True)
+
+    assert "uptime" in html
+    assert "started" in html
+    assert "20" in html  # started-at datetime renders (year)
