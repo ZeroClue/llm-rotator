@@ -6,6 +6,7 @@ sockets, no Flask, no real sleeps.
 """
 
 import http.cookiejar
+import json
 
 import pytest
 import requests
@@ -68,13 +69,31 @@ class RecordingSleeper:
         self.sleeps.append(seconds)
 
 
+class FakeGate:
+    """Semaphore stand-in: records acquire/release, never blocks."""
+
+    def __init__(self, available=True):
+        self.available = available
+        self.acquires = 0
+        self.releases = 0
+
+    def acquire(self, blocking=False):
+        self.acquires += 1
+        return self.available
+
+    def release(self):
+        self.releases += 1
+
+
 def stub_rng(lo, hi):
     return hi / 4  # deterministic quarter of the jitter band
 
 
 def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
                    backoff_base=0.5, backoff_max=8.0, use_real_session=False,
-                   retry_posts=True, persona_hygiene=False):
+                   retry_posts=True, persona_hygiene=False,
+                   anonymity_failover="cross", failover_max_wait=8.0,
+                   wait_gate=None):
     nodes = [
         rotator.Node(node_id=i, proxy=f"socks5h://node{i}.ts.net:1080", api_key=f"key{i}")
         for i in range(1, count + 1)
@@ -94,6 +113,9 @@ def make_transport(rotator, script, count=2, *, max_retries=3, timeout=25.0,
         backoff_max=backoff_max,
         retry_posts=retry_posts,
         persona_hygiene=persona_hygiene,
+        anonymity_failover=anonymity_failover,
+        failover_max_wait=failover_max_wait,
+        wait_gate=wait_gate,
     )
     return transport, ledger, sleeper, nodes, session or transport.session
 
@@ -320,6 +342,116 @@ def test_persona_hygiene_telemetry_headers(rotator, persona_hygiene):
         assert not sent & telemetry
     else:
         assert telemetry <= sent
+
+
+# ── Failover ladder (issue #46) ──────────────────────────────────────────────
+
+def test_same_mode_short_retry_after_waits_on_same_persona(rotator):
+    """429 with Retry-After <= FAILOVER_MAX_WAIT: wait out exactly what the
+    provider asked, retry the SAME persona, never touch the selector."""
+    r429 = FakeResponse(status=429, headers={"Retry-After": "3"})
+    rok = FakeResponse(status=200, content=b"ok")
+    gate = FakeGate()
+    t, ledger, sleeper, nodes, session = make_transport(
+        rotator, [r429, rok], anonymity_failover="same", wait_gate=gate)
+
+    result = t.send("POST", "http://up.test/v1/chat/completions",
+                    headers={}, payload=b"{}", canonical={"a": 1, "b": 2})
+
+    assert isinstance(result, failover.SendResult)
+    assert sleeper.sleeps == [3.0]          # the ladder wait; no backoff on top
+    assert gate.acquires == 1 and gate.releases == 1
+    proxies = [call["proxies"]["http"] for call in session.calls]
+    assert proxies == [nodes[0].proxy, nodes[0].proxy]  # same persona both tries
+    # Serialization jitter: byte-different attempts, canonically identical.
+    bodies = [call["data"] for call in session.calls]
+    assert len(set(bodies)) == 2
+    assert [json.loads(b) for b in bodies] == [{"a": 1, "b": 2}] * 2
+
+
+def test_same_mode_long_retry_after_redistributes_once(rotator):
+    """Retry-After beyond FAILOVER_MAX_WAIT: no parking — one cross-persona
+    replay, then normal selector rotation."""
+    r429 = FakeResponse(status=429, headers={"Retry-After": "30"})
+    rok = FakeResponse(status=200, content=b"ok")
+    t, ledger, sleeper, nodes, session = make_transport(
+        rotator, [r429, rok], anonymity_failover="same")
+
+    result = t.send("POST", "http://up.test/v1/chat/completions",
+                    headers={}, canonical={"k": "v"})
+
+    assert isinstance(result, failover.SendResult)
+    proxies = [call["proxies"]["http"] for call in session.calls]
+    assert proxies == [nodes[0].proxy, nodes[1].proxy]
+    # Pacing stays today's rule: Retry-After honored up to backoff_max.
+    assert sleeper.sleeps == [8.0]
+
+
+def test_same_mode_waiter_cap_skips_wait_and_rotates(rotator):
+    """A saturated waiter gate skips the ladder entirely: standard pacing,
+    selector picks another node — bounded parking, availability preserved."""
+    r429 = FakeResponse(status=429, headers={"Retry-After": "3"})
+    rok = FakeResponse(status=200, content=b"ok")
+    gate = FakeGate(available=False)
+    t, ledger, sleeper, nodes, session = make_transport(
+        rotator, [r429, rok], anonymity_failover="same", wait_gate=gate)
+
+    result = t.send("POST", "http://up.test/v1/chat/completions",
+                    headers={}, canonical={"k": "v"})
+
+    assert isinstance(result, failover.SendResult)
+    assert gate.acquires == 1 and gate.releases == 0  # refused, never held
+    proxies = [call["proxies"]["http"] for call in session.calls]
+    assert proxies == [nodes[0].proxy, nodes[1].proxy]
+
+
+def test_cross_mode_default_ignores_ladder_and_jitters_canonical(rotator):
+    """Default mode is today's availability-first behavior plus the one
+    ratified change: per-attempt serialization jitter when a canonical body
+    exists. Ladder never engages; rotation is immediate."""
+    r429 = FakeResponse(status=429, headers={"Retry-After": "3"})
+    rok = FakeResponse(status=200, content=b"ok")
+    t, ledger, sleeper, nodes, session = make_transport(rotator, [r429, rok])
+
+    result = t.send("POST", "http://up.test/v1/chat/completions",
+                    headers={}, payload=b"raw-bytes", canonical={"x": 1})
+
+    assert isinstance(result, failover.SendResult)
+    bodies = [call["data"] for call in session.calls]
+    assert len(set(bodies)) == 2  # jittered
+    assert [json.loads(b) for b in bodies] == [{"x": 1}] * 2
+    proxies = [call["proxies"]["http"] for call in session.calls]
+    assert proxies == [nodes[0].proxy, nodes[1].proxy]
+    assert sleeper.sleeps == [3.0]  # RA honored as first pacing sleep, as today
+
+
+def test_cross_mode_raw_payload_untouched_without_canonical(rotator):
+    """Non-JSON / no-canonical bodies pass through byte-for-byte as today."""
+    r503 = FakeResponse(status=503)
+    rok = FakeResponse(status=200, content=b"ok")
+    t, *_ , session = make_transport(rotator, [r503, rok])
+
+    t.send("POST", "http://up.test/v1/chat/completions",
+           headers={}, payload=b"\x00raw-opaque")
+
+    assert [call["data"] for call in session.calls] == [b"\x00raw-opaque"] * 2
+
+
+def test_invalid_anonymity_failover_mode_rejected(rotator):
+    with pytest.raises(ValueError, match="anonymity_failover"):
+        make_transport(rotator, [], anonymity_failover="yolo")
+
+
+def test_serialize_attempt_varies_bytes_preserves_value():
+    canonical = {"b": 1, "a": [1, 2]}
+    variants = {failover.serialize_attempt(canonical, i) for i in range(4)}
+    assert len(variants) >= 2
+    for i in range(4):
+        wire = failover.serialize_attempt(canonical, i)
+        assert json.loads(wire) == canonical
+    # Deterministic per attempt index.
+    assert (failover.serialize_attempt(canonical, 0)
+            == failover.serialize_attempt(canonical, 0))
 
 
 def test_production_session_never_stores_upstream_cookies(rotator):
