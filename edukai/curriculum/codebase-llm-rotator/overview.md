@@ -8,11 +8,10 @@ The app is built lazily and exactly once from the environment: importing `rotato
 
 - Module/app lifecycle is lazy and single-build: bare import is side-effect-free; global state exists only after `get_app()`/`create_app()` runs — see `lessons/2026-08-24-views-get-state-by-injection-not-import.md`
 - Views and dashboard modules take injected context providers instead of importing rotator, for a verified runtime reason — same lesson as above.
-- Landing discipline: even edukai/-only commits ride ticket → branch → PR → CI → squash; direct-to-main commits strand work off the merge path — see `lessons/2026-08-24-main-is-gated-even-for-store-commits.md`
+- Landing discipline: `main` is gated except for edukai/-only commits, which take a documented fast lane (direct to main, store audit instead of review) — see `lessons/2026-08-24-edukai-commits-take-the-fast-lane.md`
 
 ## Open questions
 
 - How `FailoverTransport`'s constructor seams (session/sleeper/rng injection) should map onto transports beyond requests/curl_cffi — candidate for a second lesson once next touched.
-- Whether heartbeat-sized store commits deserve a fast lane through the gated workflow (currently one issue + PR each) — policy decision pending.
 
 Lessons: 2 · oldest 2026-08-24 · newest 2026-08-24 — refresh on every regeneration; old dates mean re-verify before trusting.

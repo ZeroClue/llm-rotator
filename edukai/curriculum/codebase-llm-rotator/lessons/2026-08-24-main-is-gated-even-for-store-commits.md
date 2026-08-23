@@ -4,9 +4,9 @@ domain: codebase-llm-rotator
 created: 2026-08-24
 verified: 2026-08-24
 confidence: tested
-status: active
+status: superseded
 supersedes:
-superseded_by:
+superseded_by: lessons/2026-08-24-edukai-commits-take-the-fast-lane.md
 tags: [process, workflow, git]
 ---
 

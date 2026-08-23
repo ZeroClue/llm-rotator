@@ -19,7 +19,7 @@ Capture raw while working; distill before leaving.
 | User corrects you or says "remember this" | Write the lesson immediately, mid-session |
 | Context worth keeping but not yet understood | Append to `notebook/YYYY-MM-DD.md` |
 | A fact changed | New lesson with `supersedes:` set; mark the old one `status: superseded`, `superseded_by:` pointing forward |
-| Session end / heartbeat — trigger when the notebook passes ~20 lines, a topic switches, or the user wraps up | Distill notebook entries into lessons; regenerate touched `overview.md`; run the verification sweep and Audit checks; update `SYLLABUS.md`; commit if dirty — staging only paths inside this store; push only if this store is a standalone repo (rejected push: pull --rebase, resolve, retry once) |
+| Session end / heartbeat — trigger when the notebook passes ~20 lines, a topic switches, or the user wraps up | Distill notebook entries into lessons; regenerate touched `overview.md`; run the verification sweep and Audit checks; update `SYLLABUS.md`; commit if dirty — staging only paths inside this store — and land via the host repo's `edukai/` fast lane (direct to `main`, no ticket/PR; anything mixed with paths outside this store takes the host's full gated workflow) |
 
 ### Rules
 
