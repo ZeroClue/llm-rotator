@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-rotator · operator</title>
+<script src="/static/vendor/htmx.min.js"></script>
+<link rel="stylesheet" href="/static/admin.css">
+<noscript><meta http-equiv="refresh" content="5"></noscript>
+</head>
+<body>
+<header>
+  <h1>llm-rotator <span class="dim">/ operator</span></h1>
+  {% if draining %}<span class="pill pill-dep">draining — shutdown in progress</span>{% endif %}
+</header>
+
+<main>
+  <section id="nodes-section">
+    {% include "admin_nodes.html" %}
+  </section>
+
+  <section id="requests-section">
+    <h2>Recent requests</h2>
+    <p class="dim">Lands with dashboard T3 (#63).</p>
+  </section>
+
+  <section id="config-section">
+    {% include "admin_config.html" %}
+  </section>
+</main>
+
+<footer>
+  uptime {{ "%.0f"|format(uptime_seconds) }}s · read-only · loopback-trust
+</footer>
+</body>
+</html>

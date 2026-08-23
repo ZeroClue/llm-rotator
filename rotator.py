@@ -352,7 +352,11 @@ def echo_request_id(response):
 
 
 def require_bearer_token():
-    if not settings.auth_token or request.path in ("/health", "/ready", "/metrics"):
+    # /admin* is exempt like /health: the dashboard is read-only and the
+    # bind address is the trust boundary (docs/dashboard-spec.md §5).
+    if (not settings.auth_token
+            or request.path in ("/health", "/ready", "/metrics")
+            or request.path.startswith("/admin")):
         return None
     provided = request.headers.get("Authorization", "")
     # Bytes, not str: compare_digest raises TypeError on non-ASCII str, and
@@ -680,6 +684,31 @@ def create_app(cfg=None, optimization_config=None) -> Flask:
     application.add_url_rule("/ready", "ready_check", ready_check)
     application.add_url_rule("/metrics", "metrics", metrics)
     application.add_url_rule("/v1/models", "list_models", list_models)
+
+    # Operator dashboard (docs/dashboard-spec.md): read-only, loopback-trust,
+    # served by this process. Fragments poll via vendored htmx.
+    from admin_dashboard import register_admin_dashboard
+
+    def _admin_context():
+        now = time.monotonic()
+        snapshot = node_health_snapshot(NODE_POOL, health_ledger)
+        cursor_index = node_selector.current_index
+        for position, entry in enumerate(snapshot):
+            entry["is_cursor"] = position == cursor_index
+            entry["window"] = telemetry.node_window(entry["node_id"], now=now)
+            entry["last_error"] = telemetry.last_error(entry["node_id"])
+        return {
+            "nodes": snapshot,
+            "nodes_available": sum(1 for e in snapshot
+                                   if e["cooldown_seconds"] <= 0),
+            "inflight": shutdown_state.inflight if shutdown_state else 0,
+            "draining": shutdown_state.draining() if shutdown_state else False,
+            "settings": settings,
+            "opt": OPTIMIZATION_CONFIG,
+            "uptime_seconds": time.time() - APP_STARTED_AT if APP_STARTED_AT else 0,
+        }
+
+    register_admin_dashboard(application, context_provider=_admin_context)
     application.before_request(assign_request_id)
     application.before_request(require_bearer_token)
     application.after_request(echo_request_id)

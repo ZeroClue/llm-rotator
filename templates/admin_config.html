@@ -1,0 +1,41 @@
+<div id="config">
+  <h2>Effective configuration</h2>
+  <p class="dim">Frozen at boot — restart to change. Keys are always masked.</p>
+  <dl>
+    <dt>provider <span class="env">LLM_PROVIDER_URL</span></dt>
+    <dd>{{ settings.target_provider_url }}</dd>
+
+    <dt>auth token <span class="env">PROXY_AUTH_TOKEN</span></dt>
+    <dd>{{ mask(settings.auth_token) }}</dd>
+
+    <dt>retries <span class="env">MAX_RETRIES · REQUEST_TIMEOUT</span></dt>
+    <dd>{{ settings.max_retries }} × {{ settings.request_timeout }}s · backoff
+        {{ settings.retry_backoff_base }}→{{ settings.retry_backoff_max }}s
+        <span class="env">RETRY_BACKOFF_BASE · RETRY_BACKOFF_MAX</span></dd>
+
+    <dt>retry posts <span class="env">RETRY_POSTS</span></dt>
+    <dd>{{ settings.retry_posts }}</dd>
+
+    <dt>failover ladder <span class="env">ANONYMITY_FAILOVER · FAILOVER_MAX_WAIT · FAILOVER_MAX_WAITERS</span></dt>
+    <dd>{{ settings.anonymity_failover }} · wait ≤ {{ settings.failover_max_wait }}s ·
+        waiter cap {{ settings.failover_max_waiters }} · jitter {{ settings.redistribution_jitter }}
+        <span class="env">REDISTRIBUTION_JITTER</span></dd>
+
+    <dt>transport <span class="env">TRANSPORT</span></dt>
+    <dd>{{ settings.transport }}</dd>
+
+    <dt>persona hygiene <span class="env">PERSONA_HYGIENE</span></dt>
+    <dd>{{ settings.persona_hygiene }}</dd>
+
+    <dt>optimization <span class="env">ENABLE_CONTEXT_COMPRESSION · PROVIDER_PROFILE</span></dt>
+    <dd>enabled={{ opt.enabled }} · ctx {{ opt.max_context_tokens }} / keep
+        {{ opt.reserved_response_tokens }} · dedup {{ opt.remove_duplicates }} ·
+        whitespace {{ opt.strip_whitespace }}</dd>
+
+    <dt>cooldowns <span class="env">NODE_COOLDOWN_BASE · NODE_COOLDOWN_MAX</span></dt>
+    <dd>{{ settings.node_cooldown_base }}s → {{ settings.node_cooldown_max }}s</dd>
+
+    <dt>drain window <span class="env">STREAM_DRAIN_WINDOW</span></dt>
+    <dd>{{ settings.stream_drain_window }}s</dd>
+  </dl>
+</div>
